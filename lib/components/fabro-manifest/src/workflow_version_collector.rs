@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use fabro_api::types;
+use fabro_config::project::WorkflowLocation;
 use fabro_types::{
     WorkflowPath, WorkflowPathParseError, WorkflowVersion, WorkflowVersionId,
     WorkflowVersionShapeError,
@@ -95,9 +96,56 @@ pub fn collect_workflow_versions(
             }
         })?;
 
+    let package_root =
+        checkout_root
+            .canonicalize()
+            .map_err(|source| WorkflowVersionCollectError::Collect {
+                path:   workflow.to_path_buf(),
+                source: anyhow::Error::new(source).context(format!(
+                    "failed to canonicalize workflow package root {}",
+                    checkout_root.display()
+                )),
+            })?;
+    let location = canonicalize_location(location, workflow)?;
+    collect_workflow_versions_at_location(&location, &package_root, workflow)
+}
+
+fn canonicalize_location(
+    location: WorkflowLocation,
+    workflow: &Path,
+) -> Result<WorkflowLocation, WorkflowVersionCollectError> {
+    let canonicalize = |path: &Path| {
+        path.canonicalize()
+            .map_err(|source| WorkflowVersionCollectError::Collect {
+                path:   workflow.to_path_buf(),
+                source: anyhow::Error::new(source).context(format!(
+                    "failed to canonicalize workflow path {}",
+                    path.display()
+                )),
+            })
+    };
+    let graph = canonicalize(&location.graph)?;
+    let toml = location.toml.as_deref().map(canonicalize).transpose()?;
+    let dir = graph
+        .parent()
+        .expect("a canonical workflow graph has a parent")
+        .to_path_buf();
+    Ok(WorkflowLocation {
+        dir,
+        graph,
+        toml,
+        slug: location.slug,
+    })
+}
+
+pub(super) fn collect_workflow_versions_at_location(
+    location: &WorkflowLocation,
+    package_root: &Path,
+    workflow: &Path,
+) -> Result<CollectedWorkflowClosure, WorkflowVersionCollectError> {
     let inputs = HashMap::new();
-    let collected = WorkflowBundler::new(checkout_root, &inputs)
-        .collect_versions(&location)
+    let collected = WorkflowBundler::new(package_root, &inputs)
+        .collect_versions(location)
         .map_err(|source| WorkflowVersionCollectError::Collect {
             path: workflow.to_path_buf(),
             source,

@@ -16,11 +16,12 @@ use fabro_template::{
 };
 use fabro_types::ManifestPath;
 use fabro_types::graph::ReferenceKind;
+use thiserror::Error;
 
 use crate::{manifest_path_from_absolute, normalize_absolute_path};
 
 pub(super) struct WorkflowBundler<'a> {
-    cwd: &'a Path,
+    package_root: &'a Path,
     inputs: &'a HashMap<String, toml::Value>,
     template_store: FilesystemTemplateStore,
     workflows: HashMap<String, CollectedWorkflowSource>,
@@ -39,11 +40,11 @@ pub(super) struct CollectedWorkflowSource {
 }
 
 impl<'a> WorkflowBundler<'a> {
-    pub(super) fn new(cwd: &'a Path, inputs: &'a HashMap<String, toml::Value>) -> Self {
+    pub(super) fn new(package_root: &'a Path, inputs: &'a HashMap<String, toml::Value>) -> Self {
         Self {
-            cwd,
+            package_root,
             inputs,
-            template_store: FilesystemTemplateStore::new(cwd),
+            template_store: FilesystemTemplateStore::new(package_root),
             workflows: HashMap::new(),
             visited_workflows: HashSet::new(),
             workflow_version_projection: false,
@@ -55,7 +56,7 @@ impl<'a> WorkflowBundler<'a> {
         workflow: &Path,
         project_config: Option<(&ManifestPath, &str)>,
     ) -> Result<HashMap<String, types::ManifestWorkflow>> {
-        let root_key = self.collect_workflow_entry(workflow, self.cwd)?;
+        let root_key = self.collect_workflow_entry(workflow, self.package_root)?;
 
         if let Some((config_path, source)) = project_config {
             let mut root = self
@@ -89,19 +90,18 @@ impl<'a> WorkflowBundler<'a> {
 
     /// Collects the workflow at `location` and returns its manifest key.
     fn collect_workflow_location(&mut self, location: &WorkflowLocation) -> Result<String> {
-        let dot_path = manifest_path_from_absolute(&location.graph, self.cwd)?;
+        let dot_path = manifest_path_from_absolute(&location.graph, self.package_root)?;
         let dot_key = dot_path.to_string();
         if !self.visited_workflows.insert(dot_key.clone()) {
             return Ok(dot_key);
         }
 
-        let source = std::fs::read_to_string(&location.graph)
-            .with_context(|| format!("Failed to read {}", location.graph.display()))?;
+        let source = self.read_package_file(&location.graph)?;
         let config = if let Some(workflow_toml_path) = location.toml.as_ref() {
             Some(types::ManifestWorkflowConfig {
-                path:   manifest_path_from_absolute(workflow_toml_path, self.cwd)?.to_string(),
-                source: std::fs::read_to_string(workflow_toml_path)
-                    .with_context(|| format!("Failed to read {}", workflow_toml_path.display()))?,
+                path:   manifest_path_from_absolute(workflow_toml_path, self.package_root)?
+                    .to_string(),
+                source: self.read_package_file(workflow_toml_path)?,
             })
         } else {
             None
@@ -253,10 +253,7 @@ impl<'a> WorkflowBundler<'a> {
 
         for imported in imports {
             if visited_imports.insert(imported.path.to_string()) {
-                let imported_source = std::fs::read_to_string(&imported.absolute_path)
-                    .with_context(|| {
-                        format!("Failed to read {}", imported.absolute_path.display())
-                    })?;
+                let imported_source = self.read_package_file(&imported.absolute_path)?;
                 let imported_scan = WorkflowScanInput {
                     absolute_dot_path: imported.absolute_path,
                     dot_path:          imported.path,
@@ -286,8 +283,7 @@ impl<'a> WorkflowBundler<'a> {
         bundled: &BundledFile,
         workflow_template_root: &ManifestPath,
     ) -> Result<()> {
-        let source = std::fs::read_to_string(&bundled.absolute_path)
-            .with_context(|| format!("Failed to read {}", bundled.absolute_path.display()))?;
+        let source = self.read_package_file(&bundled.absolute_path)?;
         let template_root = template_root_for_bundled_file(&bundled.path, workflow_template_root)?;
         self.collect_template_include_files(
             files,
@@ -375,7 +371,7 @@ impl<'a> WorkflowBundler<'a> {
         let layer = source
             .parse::<SettingsLayer>()
             .context("Failed to parse run config TOML")?;
-        let absolute_config_path = self.cwd.join(config_path.as_path());
+        let absolute_config_path = self.package_root.join(config_path.as_path());
         let base_dir = absolute_config_path
             .parent()
             .unwrap_or_else(|| Path::new("."));
@@ -460,11 +456,10 @@ impl<'a> WorkflowBundler<'a> {
 
         let absolute_path = normalize_absolute_path(base_dir, reference)
             .ok_or_else(|| anyhow!("unsupported manifest reference: {reference}"))?;
-        let path = manifest_path_from_absolute(&absolute_path, self.cwd)?;
+        let path = manifest_path_from_absolute(&absolute_path, self.package_root)?;
         let key = path.to_string();
         if !files.contains_key(&key) {
-            let content = std::fs::read_to_string(&absolute_path)
-                .with_context(|| format!("Failed to read {}", absolute_path.display()))?;
+            let content = self.read_package_file(&absolute_path)?;
             files.insert(key.clone(), types::ManifestFileEntry {
                 content,
                 ref_: types::ManifestFileRef {
@@ -480,6 +475,54 @@ impl<'a> WorkflowBundler<'a> {
             path,
         })
     }
+
+    fn read_package_file(&self, path: &Path) -> Result<String> {
+        if !self.workflow_version_projection {
+            return std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read {}", path.display()));
+        }
+        let canonical =
+            path.canonicalize()
+                .map_err(|source| PackageFileReadError::Canonicalize {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        if !canonical.starts_with(self.package_root) {
+            return Err(PackageFileReadError::EscapesSourceRoot {
+                path:        path.to_path_buf(),
+                source_root: self.package_root.to_path_buf(),
+            }
+            .into());
+        }
+        std::fs::read_to_string(&canonical).map_err(|source| {
+            PackageFileReadError::Read {
+                path: canonical,
+                source,
+            }
+            .into()
+        })
+    }
+}
+
+#[derive(Debug, Error)]
+enum PackageFileReadError {
+    #[error("failed to canonicalize workflow package file `{path}`")]
+    Canonicalize {
+        path:   PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("workflow package file `{path}` escapes source root `{source_root}`")]
+    EscapesSourceRoot {
+        path:        PathBuf,
+        source_root: PathBuf,
+    },
+    #[error("failed to read workflow package file `{path}`")]
+    Read {
+        path:   PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 struct WorkflowScanInput {

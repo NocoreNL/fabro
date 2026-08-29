@@ -1563,7 +1563,10 @@ fn preflight_response(
     }
 }
 
-fn workflow_summary(validated: &Validated, target_path: &Path) -> types::PreflightWorkflowSummary {
+pub(crate) fn workflow_summary(
+    validated: &Validated,
+    target_path: &Path,
+) -> types::PreflightWorkflowSummary {
     types::PreflightWorkflowSummary {
         diagnostics: diagnostics_to_api(validated.diagnostics()),
         edges:       i64::try_from(validated.graph().edges.len())

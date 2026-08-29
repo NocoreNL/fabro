@@ -4,10 +4,11 @@ use std::path::{Component, Path, PathBuf};
 use fabro_config::parse::SettingsSource;
 use fabro_config::{EnvironmentLayer, RunEnvironmentLayer, RunGoalLayer, SettingsLayer};
 use fabro_environment::{EnvironmentId, EnvironmentValidationError};
+use fabro_manifest::CollectedWorkflowClosure;
 use fabro_types::settings::InterpString;
 use fabro_types::{
     GitContext, ManifestPath, RunTarget, SandboxProviderKind, TargetValidationError, WorkflowPath,
-    WorkflowVersionId,
+    WorkflowVersion, WorkflowVersionId,
 };
 use fabro_workflow::git;
 use fabro_workflow::workflow_bundle::{BundledWorkflow, ParsedWorkflowConfig, WorkflowBundle};
@@ -183,8 +184,69 @@ pub(crate) enum WorkflowClosureLoweringError {
     },
 }
 
-pub(crate) fn lower_workflow_closure(
-    closure: &LoadedWorkflowVersionClosure,
+trait WorkflowClosureView {
+    fn root_id(&self) -> WorkflowVersionId;
+    fn root(&self) -> &WorkflowVersion;
+    fn validated_root(&self) -> &ValidatedWorkflowVersion;
+    fn get(&self, id: &WorkflowVersionId) -> Option<&WorkflowVersion>;
+}
+
+impl WorkflowClosureView for LoadedWorkflowVersionClosure {
+    fn root_id(&self) -> WorkflowVersionId {
+        self.root_id()
+    }
+
+    fn root(&self) -> &WorkflowVersion {
+        self.root()
+    }
+
+    fn validated_root(&self) -> &ValidatedWorkflowVersion {
+        self.validated_root()
+    }
+
+    fn get(&self, id: &WorkflowVersionId) -> Option<&WorkflowVersion> {
+        self.get(id)
+    }
+}
+
+struct CollectedWorkflowClosureView<'a> {
+    root_id:  WorkflowVersionId,
+    versions: HashMap<WorkflowVersionId, &'a ValidatedWorkflowVersion>,
+}
+
+impl<'a> CollectedWorkflowClosureView<'a> {
+    fn new(closure: &'a CollectedWorkflowClosure) -> Result<Self, WorkflowClosureLoweringError> {
+        let root_id = closure.root_id();
+        let versions = closure.versions().collect::<HashMap<_, _>>();
+        if !versions.contains_key(&root_id) {
+            return Err(WorkflowClosureLoweringError::MissingVersion { id: root_id });
+        }
+        Ok(Self { root_id, versions })
+    }
+}
+
+impl WorkflowClosureView for CollectedWorkflowClosureView<'_> {
+    fn root_id(&self) -> WorkflowVersionId {
+        self.root_id
+    }
+
+    fn root(&self) -> &WorkflowVersion {
+        self.validated_root().version()
+    }
+
+    fn validated_root(&self) -> &ValidatedWorkflowVersion {
+        self.versions
+            .get(&self.root_id)
+            .expect("collected closure view construction verifies its root")
+    }
+
+    fn get(&self, id: &WorkflowVersionId) -> Option<&WorkflowVersion> {
+        self.versions.get(id).map(|version| version.version())
+    }
+}
+
+fn lower_workflow_closure_view(
+    closure: &impl WorkflowClosureView,
 ) -> Result<LoweredWorkflowClosure, WorkflowClosureLoweringError> {
     let entrypoint = manifest_path(closure.root().entrypoint(), closure.root().entrypoint())?;
     let mut mounts = HashMap::new();
@@ -227,6 +289,19 @@ pub(crate) fn lower_workflow_closure(
     })
 }
 
+pub(crate) fn lower_workflow_closure(
+    closure: &LoadedWorkflowVersionClosure,
+) -> Result<LoweredWorkflowClosure, WorkflowClosureLoweringError> {
+    lower_workflow_closure_view(closure)
+}
+
+pub(crate) fn lower_collected_workflow_closure(
+    closure: &CollectedWorkflowClosure,
+) -> Result<LoweredWorkflowClosure, WorkflowClosureLoweringError> {
+    let view = CollectedWorkflowClosureView::new(closure)?;
+    lower_workflow_closure_view(&view)
+}
+
 pub(crate) fn pin_workflow_environment_authority(layer: &mut SettingsLayer, environment_id: &str) {
     // Both blocks destructure without `..` so adding a field to either layer
     // type forces a compile-time decision here: server-owned facts are
@@ -262,7 +337,7 @@ pub(crate) fn pin_workflow_environment_authority(layer: &mut SettingsLayer, envi
 }
 
 fn mount_version(
-    closure: &LoadedWorkflowVersionClosure,
+    closure: &impl WorkflowClosureView,
     id: WorkflowVersionId,
     mounted_entrypoint: ManifestPath,
     mounts: &mut HashMap<ManifestPath, WorkflowVersionId>,
@@ -458,6 +533,58 @@ mod tests {
             WorkflowVersion::new(workflow_path(entrypoint), files, dependencies).unwrap(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn collected_and_stored_closures_lower_through_the_same_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let child = temp.path().join("child");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&child).unwrap();
+        fs::write(
+            root.join("workflow.toml"),
+            "_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n[run.goal]\nfile = \"goal.md\"\n",
+        )
+        .await
+        .unwrap();
+        fs::write(
+            root.join("workflow.fabro"),
+            "digraph Root { child [stack.child_workflow=\"../child/workflow.fabro\"] }",
+        )
+        .await
+        .unwrap();
+        fs::write(root.join("goal.md"), "Ship it").await.unwrap();
+        fs::write(child.join("workflow.fabro"), "digraph Child {}")
+            .await
+            .unwrap();
+
+        let collected =
+            fabro_manifest::collect_workflow_versions(&root.join("workflow.toml"), temp.path())
+                .unwrap();
+        let (database, _) = crate::test_support::test_store_bundle();
+        let store = WorkflowVersionStore::new(database.blobs());
+        for (_, version) in collected.versions() {
+            store.put(version).await.unwrap();
+        }
+        let stored = store
+            .get_closure(&collected.root_id())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let from_collected = lower_collected_workflow_closure(&collected).unwrap();
+        let from_stored = lower_workflow_closure(&stored).unwrap();
+
+        assert_eq!(from_collected.entrypoint, from_stored.entrypoint);
+        assert_eq!(
+            serde_json::to_value(from_collected.workflow_bundle.workflows()).unwrap(),
+            serde_json::to_value(from_stored.workflow_bundle.workflows()).unwrap(),
+        );
+        assert_eq!(
+            format!("{:?}", from_collected.workflow_layer),
+            format!("{:?}", from_stored.workflow_layer),
+        );
     }
 
     #[tokio::test]
