@@ -61,6 +61,11 @@ impl WorkflowBundle {
     pub fn workflows(&self) -> &HashMap<ManifestPath, BundledWorkflow> {
         &self.workflows
     }
+
+    #[must_use]
+    pub fn into_workflows(self) -> HashMap<ManifestPath, BundledWorkflow> {
+        self.workflows
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

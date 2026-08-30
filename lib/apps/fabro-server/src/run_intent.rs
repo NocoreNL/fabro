@@ -184,20 +184,21 @@ pub(crate) enum WorkflowClosureLoweringError {
     },
 }
 
+/// Read access to a workflow-version closure, whether loaded from the store
+/// or collected from a local checkout, so both lower through one path.
 trait WorkflowClosureView {
     fn root_id(&self) -> WorkflowVersionId;
-    fn root(&self) -> &WorkflowVersion;
     fn validated_root(&self) -> &ValidatedWorkflowVersion;
     fn get(&self, id: &WorkflowVersionId) -> Option<&WorkflowVersion>;
+
+    fn root(&self) -> &WorkflowVersion {
+        self.validated_root().version()
+    }
 }
 
 impl WorkflowClosureView for LoadedWorkflowVersionClosure {
     fn root_id(&self) -> WorkflowVersionId {
         self.root_id()
-    }
-
-    fn root(&self) -> &WorkflowVersion {
-        self.root()
     }
 
     fn validated_root(&self) -> &ValidatedWorkflowVersion {
@@ -211,6 +212,7 @@ impl WorkflowClosureView for LoadedWorkflowVersionClosure {
 
 struct CollectedWorkflowClosureView<'a> {
     root_id:  WorkflowVersionId,
+    root:     &'a ValidatedWorkflowVersion,
     versions: HashMap<WorkflowVersionId, &'a ValidatedWorkflowVersion>,
 }
 
@@ -218,10 +220,14 @@ impl<'a> CollectedWorkflowClosureView<'a> {
     fn new(closure: &'a CollectedWorkflowClosure) -> Result<Self, WorkflowClosureLoweringError> {
         let root_id = closure.root_id();
         let versions = closure.versions().collect::<HashMap<_, _>>();
-        if !versions.contains_key(&root_id) {
-            return Err(WorkflowClosureLoweringError::MissingVersion { id: root_id });
-        }
-        Ok(Self { root_id, versions })
+        let root = *versions
+            .get(&root_id)
+            .ok_or(WorkflowClosureLoweringError::MissingVersion { id: root_id })?;
+        Ok(Self {
+            root_id,
+            root,
+            versions,
+        })
     }
 }
 
@@ -230,14 +236,8 @@ impl WorkflowClosureView for CollectedWorkflowClosureView<'_> {
         self.root_id
     }
 
-    fn root(&self) -> &WorkflowVersion {
-        self.validated_root().version()
-    }
-
     fn validated_root(&self) -> &ValidatedWorkflowVersion {
-        self.versions
-            .get(&self.root_id)
-            .expect("collected closure view construction verifies its root")
+        self.root
     }
 
     fn get(&self, id: &WorkflowVersionId) -> Option<&WorkflowVersion> {

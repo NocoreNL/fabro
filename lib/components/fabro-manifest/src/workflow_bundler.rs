@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use fabro_api::types;
 use fabro_config::project::WorkflowLocation;
 use fabro_config::{
@@ -16,7 +16,6 @@ use fabro_template::{
 };
 use fabro_types::ManifestPath;
 use fabro_types::graph::ReferenceKind;
-use thiserror::Error;
 
 use crate::{manifest_path_from_absolute, normalize_absolute_path};
 
@@ -481,48 +480,26 @@ impl<'a> WorkflowBundler<'a> {
             return std::fs::read_to_string(path)
                 .with_context(|| format!("Failed to read {}", path.display()));
         }
-        let canonical =
-            path.canonicalize()
-                .map_err(|source| PackageFileReadError::Canonicalize {
-                    path: path.to_path_buf(),
-                    source,
-                })?;
+        let canonical = path.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize workflow package file `{}`",
+                path.display()
+            )
+        })?;
         if !canonical.starts_with(self.package_root) {
-            return Err(PackageFileReadError::EscapesSourceRoot {
-                path:        path.to_path_buf(),
-                source_root: self.package_root.to_path_buf(),
-            }
-            .into());
+            bail!(
+                "workflow package file `{}` escapes source root `{}`",
+                path.display(),
+                self.package_root.display()
+            );
         }
-        std::fs::read_to_string(&canonical).map_err(|source| {
-            PackageFileReadError::Read {
-                path: canonical,
-                source,
-            }
-            .into()
+        std::fs::read_to_string(&canonical).with_context(|| {
+            format!(
+                "failed to read workflow package file `{}`",
+                canonical.display()
+            )
         })
     }
-}
-
-#[derive(Debug, Error)]
-enum PackageFileReadError {
-    #[error("failed to canonicalize workflow package file `{path}`")]
-    Canonicalize {
-        path:   PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("workflow package file `{path}` escapes source root `{source_root}`")]
-    EscapesSourceRoot {
-        path:        PathBuf,
-        source_root: PathBuf,
-    },
-    #[error("failed to read workflow package file `{path}`")]
-    Read {
-        path:   PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
 }
 
 struct WorkflowScanInput {

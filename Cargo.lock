@@ -2826,6 +2826,7 @@ dependencies = [
  "fabro-template",
  "fabro-test",
  "fabro-types",
+ "fabro-util",
  "fabro-workflow",
  "fabro-workflow-version",
  "git2",

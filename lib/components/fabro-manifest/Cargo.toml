@@ -28,6 +28,7 @@ toml.workspace = true
 
 [dev-dependencies]
 fabro-test.workspace = true
+fabro-util = { path = "../../foundation/fabro-util" }
 insta.workspace = true
 serde_json.workspace = true
 tempfile = "3"

@@ -29,7 +29,7 @@ use fabro_types::{
     DirtyStatus, GitContext, GitHubRepositorySlug, GitRunTarget, ManifestPath, WorkflowSettings,
 };
 use fabro_workflow::git::{
-    GitSyncStatus, branch_needs_push, head_sha, push_branch_noninteractive, sync_status,
+    GitSyncStatus, branch_needs_push, push_branch_noninteractive, sync_status,
 };
 
 pub use crate::local_workflow_package::{
@@ -217,7 +217,7 @@ pub fn build_run_manifest(input: ManifestBuildInput) -> Result<BuiltManifest> {
 
     let configured_repo_origin_url = configured_repo_origin_url(&workflow_settings);
     let git = observe_git_run_target(&working_directory, configured_repo_origin_url.as_deref())
-        .map(GitRunTargetObservation::into_legacy_git_context);
+        .map(|observation| observation.legacy_git_context);
     let args = input.args.filter(|args| !manifest_args_is_empty(args));
 
     Ok(BuiltManifest {
@@ -316,35 +316,8 @@ fn resolved_goal_to_manifest(resolved: ResolvedRunGoal) -> types::ManifestGoal {
 /// SHA and normalized-origin behavior independently.
 #[derive(Clone, Debug)]
 pub struct GitRunTargetObservation {
-    run_target:         Option<GitRunTarget>,
-    legacy_git_context: GitContext,
-}
-
-impl GitRunTargetObservation {
-    #[must_use]
-    pub fn run_target(&self) -> Option<&GitRunTarget> {
-        self.run_target.as_ref()
-    }
-
-    #[must_use]
-    pub fn into_run_target(self) -> Option<GitRunTarget> {
-        self.run_target
-    }
-
-    #[must_use]
-    pub fn dirty(&self) -> DirtyStatus {
-        self.legacy_git_context.dirty
-    }
-
-    #[must_use]
-    pub fn legacy_git_context(&self) -> &GitContext {
-        &self.legacy_git_context
-    }
-
-    #[must_use]
-    pub fn into_legacy_git_context(self) -> GitContext {
-        self.legacy_git_context
-    }
+    pub run_target:         Option<GitRunTarget>,
+    pub legacy_git_context: GitContext,
 }
 
 /// Observe Git facts without choosing an environment or a non-Git target.
@@ -357,8 +330,12 @@ pub fn observe_git_run_target(
     repo_path: &Path,
     configured_repo_origin_url: Option<&str>,
 ) -> Option<GitRunTargetObservation> {
-    let (origin_url, push_origin_url, branch) = detect_manifest_repo_info(repo_path)?;
-    let sha = head_sha(repo_path).ok();
+    let ManifestRepoInfo {
+        origin_url,
+        push_origin_url,
+        branch,
+        sha,
+    } = detect_manifest_repo_info(repo_path)?;
     let dirty = match sync_status(repo_path, "origin", Some(&branch)) {
         GitSyncStatus::Dirty => DirtyStatus::Dirty,
         GitSyncStatus::Synced | GitSyncStatus::Unsynced => DirtyStatus::Clean,
@@ -382,7 +359,7 @@ pub fn observe_git_run_target(
     let run_target = github_run_target(
         &repo_origin_url,
         &branch,
-        remotely_available.then(|| sha.clone()).flatten(),
+        sha.clone().filter(|_| remotely_available),
     );
     Some(GitRunTargetObservation {
         run_target,
@@ -425,7 +402,17 @@ fn configured_repo_origin_url(settings: &WorkflowSettings) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
-fn detect_manifest_repo_info(repo_path: &Path) -> Option<(Option<String>, Option<String>, String)> {
+struct ManifestRepoInfo {
+    /// The `origin` URL as libgit2 reports it (after `insteadOf` rewrites).
+    origin_url:      Option<String>,
+    /// The raw configured `remote.origin.url`, used to compare repository
+    /// identity before pushing.
+    push_origin_url: Option<String>,
+    branch:          String,
+    sha:             Option<String>,
+}
+
+fn detect_manifest_repo_info(repo_path: &Path) -> Option<ManifestRepoInfo> {
     let repo = git2::Repository::discover(repo_path).ok()?;
     if repo.is_bare() {
         return None;
@@ -435,6 +422,7 @@ fn detect_manifest_repo_info(repo_path: &Path) -> Option<(Option<String>, Option
         return None;
     }
     let branch = head.shorthand().map(ToOwned::to_owned)?;
+    let sha = head.target().map(|oid| oid.to_string());
     let origin_url = repo
         .find_remote("origin")
         .ok()
@@ -448,7 +436,12 @@ fn detect_manifest_repo_info(repo_path: &Path) -> Option<(Option<String>, Option
         .ok()
         .and_then(|config| config.get_string("remote.origin.url").ok())
         .or_else(|| origin_url.clone());
-    Some((origin_url, push_origin_url, branch))
+    Some(ManifestRepoInfo {
+        origin_url,
+        push_origin_url,
+        branch,
+        sha,
+    })
 }
 
 /// Best-effort push of the local branch so clone-based execution can see
@@ -485,12 +478,19 @@ fn push_manifest_branch_best_effort(
 /// Resolve a workflow reference and reject it when neither its config nor
 /// its graph exists on disk.
 /// A missing workflow surfaces as `fabro_config::Error::WorkflowNotFound`.
-fn resolve_existing_workflow_location(workflow: &Path, cwd: &Path) -> Result<WorkflowLocation> {
+#[expect(
+    clippy::result_large_err,
+    reason = "callers match on the concrete config error to classify missing workflows"
+)]
+fn resolve_existing_workflow_location(
+    workflow: &Path,
+    cwd: &Path,
+) -> Result<WorkflowLocation, fabro_config::Error> {
     let location = WorkflowLocation::resolve(workflow, cwd)?;
     if location.toml.is_none() && !location.graph.is_file() {
-        return Err(
-            fabro_config::Error::WorkflowNotFound(location.graph.display().to_string()).into(),
-        );
+        return Err(fabro_config::Error::WorkflowNotFound(
+            location.graph.display().to_string(),
+        ));
     }
     Ok(location)
 }
@@ -547,6 +547,8 @@ pub(crate) mod test_fixtures {
 
 #[cfg(test)]
 mod tests {
+    use fabro_workflow::git::head_sha;
+
     use super::*;
 
     fn test_environment_defaults() -> MergeMap<EnvironmentLayer> {
@@ -1724,14 +1726,14 @@ exit 1
         mark_origin_branch_synced(&workspace, "feature");
 
         let observation = observe_git_run_target(&workspace, None).unwrap();
-        let target = observation.run_target().unwrap();
-        let legacy = observation.legacy_git_context();
+        let target = observation.run_target.as_ref().unwrap();
+        let legacy = &observation.legacy_git_context;
 
         assert_eq!(target.repo, "acme/widgets");
         assert_eq!(target.branch, "feature");
         assert_eq!(target.tag, None);
         assert_eq!(target.sha, legacy.sha);
-        assert_eq!(observation.dirty(), DirtyStatus::Clean);
+        assert_eq!(legacy.dirty, DirtyStatus::Clean);
         assert_eq!(legacy.origin_url, "https://github.com/acme/widgets");
     }
 
@@ -1751,10 +1753,10 @@ exit 1
 
         let observation =
             observe_git_run_target(&workspace, Some("https://github.com/acme/widgets")).unwrap();
-        let target = observation.run_target().unwrap();
+        let target = observation.run_target.as_ref().unwrap();
 
-        assert_eq!(target.sha, observation.legacy_git_context().sha);
-        assert_eq!(bare_remote_branch_sha(&bare_origin, "feature"), target.sha,);
+        assert_eq!(target.sha, observation.legacy_git_context.sha);
+        assert_eq!(bare_remote_branch_sha(&bare_origin, "feature"), target.sha);
     }
 
     #[test]
@@ -1777,9 +1779,9 @@ exit 1
         let failed =
             observe_git_run_target(&failed_workspace, Some("https://github.com/acme/widgets"))
                 .unwrap();
-        assert_eq!(failed.run_target().unwrap().sha, None);
-        assert!(failed.legacy_git_context().sha.is_some());
-        assert_eq!(failed.dirty(), DirtyStatus::Clean);
+        assert_eq!(failed.run_target.as_ref().unwrap().sha, None);
+        assert!(failed.legacy_git_context.sha.is_some());
+        assert_eq!(failed.legacy_git_context.dirty, DirtyStatus::Clean);
 
         let mismatched_workspace = temp.path().join("mismatched");
         std::fs::create_dir_all(&mismatched_workspace).unwrap();
@@ -1795,7 +1797,7 @@ exit 1
             Some("https://github.com/acme/configured"),
         )
         .unwrap();
-        let target = mismatched.run_target().unwrap();
+        let target = mismatched.run_target.as_ref().unwrap();
         assert_eq!(target.repo, "acme/configured");
         assert_eq!(target.sha, None);
         assert_eq!(bare_remote_branch_sha(&bare_origin, "feature"), None);
@@ -1811,10 +1813,10 @@ exit 1
         std::fs::write(workspace.join("dirty.txt"), "dirty").unwrap();
 
         let unsupported = observe_git_run_target(&workspace, None).unwrap();
-        assert!(unsupported.run_target().is_none());
-        assert_eq!(unsupported.dirty(), DirtyStatus::Dirty);
+        assert!(unsupported.run_target.is_none());
+        assert_eq!(unsupported.legacy_git_context.dirty, DirtyStatus::Dirty);
         assert_eq!(
-            unsupported.legacy_git_context().origin_url,
+            unsupported.legacy_git_context.origin_url,
             fabro_github::normalize_repo_origin_url(&bare_origin.to_string_lossy()),
         );
 

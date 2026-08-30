@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use fabro_config::project::{WorkflowLocation, discover_project_config};
 use thiserror::Error;
 
-use crate::workflow_version_collector::collect_workflow_versions_at_location;
+use crate::workflow_version_collector::{
+    canonicalize_location, collect_workflow_versions_at_location,
+};
 use crate::{CollectedWorkflowClosure, WorkflowVersionCollectError};
 
 /// One local workflow resolved to a canonical package root and collected
@@ -41,11 +43,6 @@ pub enum LocalWorkflowPackageError {
         #[source]
         source: std::io::Error,
     },
-    #[error("local workflow package path `{path}` escapes source root `{source_root}`")]
-    EscapesSourceRoot {
-        path:        PathBuf,
-        source_root: PathBuf,
-    },
     #[error("failed to collect local workflow package `{workflow}`")]
     Collect {
         workflow: PathBuf,
@@ -69,11 +66,6 @@ impl ResolvedLocalWorkflowPackage {
     pub fn closure(&self) -> &CollectedWorkflowClosure {
         &self.closure
     }
-
-    #[must_use]
-    pub fn into_closure(self) -> CollectedWorkflowClosure {
-        self.closure
-    }
 }
 
 /// Resolve producer-readable workflow bytes under one stable local source
@@ -95,8 +87,12 @@ pub fn resolve_local_workflow_package(
         resolve_explicit_workflow(workflow, cwd, user_workflows_root)?
     };
     let source_root = canonicalize(&source_root)?;
-    let workflow_location = canonicalize_location(location)?;
-    ensure_location_is_within_root(&workflow_location, &source_root)?;
+    let workflow_location = canonicalize_location(location, |path, source| {
+        LocalWorkflowPackageError::Canonicalize {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
     let closure = collect_workflow_versions_at_location(&workflow_location, &source_root, workflow)
         .map_err(|source| LocalWorkflowPackageError::Collect {
             workflow: workflow.to_path_buf(),
@@ -227,19 +223,12 @@ fn resolve_location(
     selected: &Path,
     cwd: &Path,
 ) -> Result<WorkflowLocation, LocalWorkflowPackageError> {
-    let location = WorkflowLocation::resolve(selected, cwd).map_err(|source| {
+    crate::resolve_existing_workflow_location(selected, cwd).map_err(|source| {
         LocalWorkflowPackageError::Resolve {
             workflow: workflow.to_path_buf(),
             source,
         }
-    })?;
-    if location.toml.is_none() && !location.graph.is_file() {
-        return Err(LocalWorkflowPackageError::Resolve {
-            workflow: workflow.to_path_buf(),
-            source:   fabro_config::Error::WorkflowNotFound(location.graph.display().to_string()),
-        });
-    }
-    Ok(location)
+    })
 }
 
 fn worktree_root(
@@ -275,38 +264,6 @@ fn canonicalize(path: &Path) -> Result<PathBuf, LocalWorkflowPackageError> {
         })
 }
 
-fn canonicalize_location(
-    location: WorkflowLocation,
-) -> Result<WorkflowLocation, LocalWorkflowPackageError> {
-    let graph = canonicalize(&location.graph)?;
-    let toml = location.toml.as_deref().map(canonicalize).transpose()?;
-    let dir = graph
-        .parent()
-        .expect("a canonical workflow graph has a parent")
-        .to_path_buf();
-    Ok(WorkflowLocation {
-        dir,
-        graph,
-        toml,
-        slug: location.slug,
-    })
-}
-
-fn ensure_location_is_within_root(
-    location: &WorkflowLocation,
-    source_root: &Path,
-) -> Result<(), LocalWorkflowPackageError> {
-    for path in std::iter::once(&location.graph).chain(location.toml.iter()) {
-        if !path.starts_with(source_root) {
-            return Err(LocalWorkflowPackageError::EscapesSourceRoot {
-                path:        path.clone(),
-                source_root: source_root.to_path_buf(),
-            });
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     #![expect(
@@ -316,6 +273,9 @@ mod tests {
 
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    use fabro_types::WorkflowVersion;
+    use fabro_util::error::collect_chain;
 
     use crate::{LocalWorkflowPackageError, resolve_local_workflow_package};
 
@@ -349,14 +309,12 @@ mod tests {
             .collect()
     }
 
-    fn error_chain(error: &dyn std::error::Error) -> String {
-        let mut messages = vec![error.to_string()];
-        let mut source = error.source();
-        while let Some(error) = source {
-            messages.push(error.to_string());
-            source = error.source();
-        }
-        messages.join(": ")
+    fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+        collect_chain(error).join(": ")
+    }
+
+    fn root_version(package: &crate::ResolvedLocalWorkflowPackage) -> &WorkflowVersion {
+        package.closure().versions().last().unwrap().1.version()
     }
 
     #[test]
@@ -381,15 +339,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            package
-                .closure()
-                .versions()
-                .last()
-                .unwrap()
-                .1
-                .version()
-                .entrypoint()
-                .as_str(),
+            root_version(&package).entrypoint().as_str(),
             ".fabro/workflows/hello/workflow.fabro",
         );
     }
@@ -406,15 +356,7 @@ mod tests {
             resolve_local_workflow_package(Path::new("hello"), &cwd, Some(&user)).unwrap();
         assert_eq!(package.source_root(), user.canonicalize().unwrap());
         assert_eq!(
-            package
-                .closure()
-                .versions()
-                .last()
-                .unwrap()
-                .1
-                .version()
-                .entrypoint()
-                .as_str(),
+            root_version(&package).entrypoint().as_str(),
             "hello/workflow.fabro",
         );
 
@@ -474,13 +416,7 @@ mod tests {
 
         assert_eq!(package.source_root(), package_root.canonicalize().unwrap());
         assert!(
-            package
-                .closure()
-                .versions()
-                .last()
-                .unwrap()
-                .1
-                .version()
+            root_version(&package)
                 .files()
                 .keys()
                 .any(|path| path.as_str() == "shared.md"),
@@ -503,8 +439,12 @@ mod tests {
             package.source_root(),
             temp.path().join("loose").canonicalize().unwrap(),
         );
-        let root = package.closure().versions().last().unwrap().1.version();
-        assert!(root.files().keys().any(|path| path.as_str() == "prompt.md"));
+        assert!(
+            root_version(&package)
+                .files()
+                .keys()
+                .any(|path| path.as_str() == "prompt.md")
+        );
     }
 
     #[cfg(unix)]
@@ -581,10 +521,8 @@ mod tests {
 
         let error = resolve_local_workflow_package(Path::new("hello"), &project, None).unwrap_err();
 
-        assert!(matches!(
-            error,
-            LocalWorkflowPackageError::EscapesSourceRoot { .. }
-        ));
+        assert!(matches!(error, LocalWorkflowPackageError::Collect { .. }));
+        assert!(error_chain(&error).contains("escapes source root"));
     }
 
     #[test]

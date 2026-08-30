@@ -46,8 +46,8 @@ pub fn validate_collected_workflow(
     let lowered = run_intent::lower_collected_workflow_closure(closure)?;
     let workflow = lowered
         .workflow_bundle
-        .workflow(&lowered.entrypoint)
-        .cloned()
+        .into_workflows()
+        .remove(&lowered.entrypoint)
         .ok_or_else(|| anyhow!("lowered root workflow is missing from its bundle"))?;
     let mut builder = WorkflowSettingsBuilder::new()
         .server_manifest_defaults(
@@ -160,6 +160,10 @@ dockerfile = { path = "Dockerfile" }
         root.join("root/workflow.toml")
     }
 
+    fn owner_input() -> HashMap<String, toml::Value> {
+        HashMap::from([("owner".to_string(), toml::Value::String("Ada".to_string()))])
+    }
+
     fn run_overrides(goal: &str) -> RunLayer {
         RunLayer {
             goal: Some(RunGoalLayer::Inline(InterpString::parse(goal))),
@@ -172,7 +176,7 @@ dockerfile = { path = "Dockerfile" }
         let temp = tempfile::tempdir().unwrap();
         let workflow = write_complete_fixture(temp.path());
         let run = run_overrides("inline goal");
-        let inputs = HashMap::from([("owner".to_string(), toml::Value::String("Ada".to_string()))]);
+        let inputs = owner_input();
         let package = fabro_manifest::resolve_local_workflow_package(
             &workflow,
             temp.path(),
@@ -226,7 +230,7 @@ dockerfile = { path = "Dockerfile" }
         let present = validate_collected_workflow(
             package.closure(),
             Some(&run_overrides("resolved inline goal")),
-            &HashMap::from([("owner".to_string(), toml::Value::String("Ada".to_string()))]),
+            &owner_input(),
         )
         .unwrap();
         assert!(
