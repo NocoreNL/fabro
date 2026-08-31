@@ -2069,7 +2069,8 @@ reasoning = false
             settings.run.environment.provider = provider;
             settings.run.environment.image.docker = match provider {
                 EnvironmentProvider::Docker => Some("buildpack-deps:noble".to_string()),
-                EnvironmentProvider::Daytona | EnvironmentProvider::Local => None,
+                // ACA: clone-based, no docker image
+                EnvironmentProvider::Daytona | EnvironmentProvider::Local | EnvironmentProvider::Aca => None,
             };
             let (persisted, store) =
                 persisted_workflow_with_settings(MINIMAL_DOT, &storage_root, settings).await;
