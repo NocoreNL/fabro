@@ -70,7 +70,7 @@ use fabro_model::{BilledTokenCounts, Catalog, ModelRef, ModelTestMode, ProviderI
 use fabro_redact::redact_jsonl_line;
 // ACA:
 #[cfg(feature = "aca")]
-use fabro_sandbox::aca::EntraTokenSource;
+use fabro_sandbox::aca::{ACA_TOKEN_AUDIENCE, EntraTokenSource};
 use fabro_sandbox::daytona::{self, DaytonaSandbox};
 use fabro_sandbox::details::sandbox_details;
 use fabro_sandbox::reconnect::reconnect_for_run;
@@ -2343,11 +2343,6 @@ fn worker_token_keys_from_server_secrets(
     WorkerTokenKeys::from_master_secret(session_secret.as_bytes())
         .map_err(|err| jwt_auth::session_secret_key_error(&err))
 }
-
-// ACA: fixed data-plane token audience (Task 2's capture doc), distinct from
-// the region-specific data-plane host `AcaClient` talks to.
-#[cfg(feature = "aca")]
-const ACA_TOKEN_AUDIENCE: &str = "https://management.azuredevcompute.io";
 
 // ACA: reads the account-level scoping `AcaSandboxProvider` needs
 // (subscription/resourceGroup/sandboxGroup/region — see

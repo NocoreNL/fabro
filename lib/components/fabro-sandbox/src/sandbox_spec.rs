@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "docker")]
 use anyhow::Context as _;
-#[cfg(any(feature = "docker", feature = "daytona"))]
+#[cfg(any(feature = "docker", feature = "daytona", feature = "aca"))]
 use fabro_github::GitHubCredentials;
 #[allow(
     unused_imports,
@@ -11,6 +11,9 @@ use fabro_github::GitHubCredentials;
 )]
 use fabro_types::{RunId, RunSandboxInstance, RunSandboxRuntime, SandboxProviderKind};
 
+// ACA:
+#[cfg(feature = "aca")]
+use crate::aca::{AcaConfig, AcaSandbox, EntraTokenSource, ACA_TOKEN_AUDIENCE};
 #[cfg(any(feature = "docker", feature = "daytona"))]
 use crate::clone_source;
 #[cfg(feature = "daytona")]
@@ -18,6 +21,11 @@ use crate::daytona::{self, DaytonaConfig, DaytonaSandbox};
 #[cfg(feature = "docker")]
 use crate::docker::{self, DockerSandbox, DockerSandboxOptions};
 use crate::local::LocalSandbox;
+// ACA:
+#[cfg(feature = "aca")]
+use crate::provider::aca::{AcaSandboxProvider, aca_account_from_process_env};
+#[cfg(feature = "aca")]
+use crate::provider::{SandboxCreateSpec, SandboxProvider};
 use crate::{Sandbox, SandboxEventCallback};
 
 /// Options for sandbox initialization and construction.
@@ -46,6 +54,22 @@ pub enum SandboxSpec {
         clone_commit_sha: Option<String>,
         api_key:          Option<String>,
     },
+    // ACA: mirrors `SandboxCreateSpec::Aca`'s field shape (no `api_key` — ACA
+    // authenticates via `azure_identity`, not a bearer token) rather than
+    // `Daytona`'s: `AcaConfig` has no `skip_clone`, and no `AcaSandbox` field
+    // stores clone metadata (its disk image already has a repo baked in;
+    // there is no per-create clone step to pin a tag/commit against), so
+    // `clone_tag`/`clone_commit_sha` would have nothing to do here. Callers
+    // reject a pinned-revision request for this provider before constructing
+    // this variant (see `start.rs`'s `RunSession::new`).
+    #[cfg(feature = "aca")]
+    Aca {
+        config:           Box<AcaConfig>,
+        github_app:       Option<GitHubCredentials>,
+        run_id:           Option<RunId>,
+        clone_origin_url: Option<String>,
+        clone_branch:     Option<String>,
+    },
 }
 
 impl SandboxSpec {
@@ -56,6 +80,9 @@ impl SandboxSpec {
             Self::Docker { .. } => SandboxProviderKind::Docker,
             #[cfg(feature = "daytona")]
             Self::Daytona { .. } => SandboxProviderKind::Daytona,
+            // ACA:
+            #[cfg(feature = "aca")]
+            Self::Aca { .. } => SandboxProviderKind::Aca,
         }
     }
 
@@ -187,7 +214,8 @@ impl SandboxSpec {
 
     #[allow(
         clippy::unused_async,
-        reason = "Only Daytona construction awaits; local and Docker builds share the async API."
+        reason = "Only Daytona and Aca construction await; local and Docker builds share the \
+                  async API."
     )]
     pub async fn build(
         &self,
@@ -252,6 +280,78 @@ impl SandboxSpec {
                 if let Some(callback) = event_callback {
                     sandbox.set_event_callback(callback);
                 }
+                Ok(Arc::new(sandbox))
+            }
+            // ACA: unlike Daytona's lazy `OnceCell`-backed sandbox (created on
+            // first use), an `AcaSandbox` is a live handle over an
+            // *already-provisioned* sandbox id (see its doc comment in
+            // `aca/sandbox.rs`) — so the real sandbox must be created here,
+            // eagerly, before `AcaSandbox::new` can be built at all. Rather
+            // than re-implementing `AcaSandboxProvider::create`'s
+            // create-then-egress-then-cleanup-on-failure dance, this builds a
+            // standalone provider (env-resolved account + Entra credential,
+            // mirroring Daytona's own env-resolved API key fallback just
+            // above) and calls into it, so every `provider="aca"` run reaches
+            // the exact same `AcaSandboxProvider::create` the managed-sandbox
+            // registry uses. `event_callback` is unused: `AcaSandbox` has no
+            // `set_event_callback` (ACA's exec transport is synchronous/
+            // buffered only, per `aca/sandbox.rs`'s streaming note; there is
+            // no event stream to attach a callback to).
+            #[cfg(feature = "aca")]
+            Self::Aca {
+                config,
+                github_app,
+                run_id,
+                clone_origin_url,
+                clone_branch,
+            } => {
+                let account = aca_account_from_process_env().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "ACA sandbox provider requires ACA_SUBSCRIPTION_ID, ACA_RESOURCE_GROUP, \
+                         ACA_SANDBOX_GROUP, and ACA_REGION to be set"
+                    )
+                })?;
+                let http = fabro_http::http_client().map_err(anyhow::Error::new)?;
+                let token_source =
+                    EntraTokenSource::new(ACA_TOKEN_AUDIENCE).map_err(anyhow::Error::new)?;
+                let provider = AcaSandboxProvider::new(Arc::new(token_source), http, account.clone());
+
+                let create_spec = SandboxCreateSpec::Aca {
+                    config:           config.clone(),
+                    github_app:       github_app.clone(),
+                    run_id:           *run_id,
+                    clone_origin_url: clone_origin_url.clone(),
+                    clone_branch:     clone_branch.clone(),
+                };
+                let info = provider
+                    .create(create_spec)
+                    .await
+                    .map_err(anyhow::Error::new)?;
+
+                // The same config-wins/account-falls-back scoping
+                // `AcaSandboxProvider::create` just applied internally;
+                // `SandboxInfo` doesn't carry resource_group/sandbox_group
+                // back out, so this is re-derived rather than reused.
+                let region = if config.region.is_empty() {
+                    account.region.as_str()
+                } else {
+                    config.region.as_str()
+                };
+                let resource_group = if config.resource_group.is_empty() {
+                    account.resource_group.as_str()
+                } else {
+                    config.resource_group.as_str()
+                };
+                let sandbox_group = if config.sandbox_group.is_empty() {
+                    account.sandbox_group.as_str()
+                } else {
+                    config.sandbox_group.as_str()
+                };
+                let client = provider
+                    .client_for(region, resource_group, sandbox_group)
+                    .map_err(anyhow::Error::new)?;
+
+                let sandbox = AcaSandbox::new(Arc::new(client), info.id, config.as_ref().clone());
                 Ok(Arc::new(sandbox))
             }
         }

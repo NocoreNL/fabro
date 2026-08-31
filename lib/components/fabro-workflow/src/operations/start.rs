@@ -9,7 +9,13 @@ use fabro_interview::{AutoApproveInterviewer, Interviewer};
 use fabro_llm::client::Client as LlmClient;
 use fabro_mcp::config::McpServerSettings;
 use fabro_model::{Catalog, ProviderId};
+// ACA:
+#[cfg(feature = "aca")]
+use fabro_sandbox::aca::AcaConfig;
 use fabro_sandbox::daytona::DaytonaConfig;
+// ACA:
+#[cfg(feature = "aca")]
+use fabro_sandbox::from_environment::aca_config_from_environment;
 use fabro_sandbox::from_environment::{
     daytona_config_from_environment, docker_config_from_environment_with_secrets,
     local_working_directory_from_environment,
@@ -525,12 +531,42 @@ impl RunSession {
                     api_key,
                 }
             }
-            // ACA: workflow execution wiring (a `SandboxSpec::Aca` variant and
-            // its construction) lands in Task 13; fail closed for now.
+            // ACA: workflow execution wiring. Unlike Docker/Daytona, this
+            // rejects a pinned tag/commit request outright rather than
+            // threading `clone_source.tag`/`clone_source.commit_sha`
+            // through: `SandboxSpec::Aca` (mirroring `SandboxCreateSpec::Aca`,
+            // T4) has no field for either, because an ACA sandbox always
+            // starts from its pre-baked disk image (no per-create clone step
+            // exists to pin against) — see that variant's doc comment in
+            // `sandbox_spec.rs`. Silently dropping the pin instead would run
+            // the caller's request against whatever the image happens to
+            // contain, with no indication that the pin was never honored.
             SandboxProviderKind::Aca => {
-                return Err(Error::engine(
-                    "Aca sandbox provider is not yet supported for workflow execution",
-                ));
+                #[cfg(feature = "aca")]
+                {
+                    if clone_source.tag.is_some() || clone_source.commit_sha.is_some() {
+                        return Err(Error::engine(
+                            "the Aca sandbox provider does not support pinned tag/commit \
+                             checkout; its sandboxes always start from their pre-baked disk \
+                             image",
+                        ));
+                    }
+                    let config = resolve_aca_config(resolved);
+                    SandboxSpec::Aca {
+                        config: Box::new(config),
+                        github_app: services.github_app.clone(),
+                        run_id: Some(record.run_id),
+                        clone_origin_url: clone_source.origin_url,
+                        clone_branch: clone_source.branch,
+                    }
+                }
+                #[cfg(not(feature = "aca"))]
+                {
+                    return Err(Error::engine(
+                        "Aca sandbox provider is not enabled in this build (rebuild with \
+                         `--features aca`)",
+                    ));
+                }
             }
         };
 
@@ -780,6 +816,14 @@ fn resolve_sandbox_provider(settings: &ResolvedRunSettings) -> SandboxProviderKi
 
 fn resolve_daytona_config(settings: &ResolvedRunSettings) -> DaytonaConfig {
     daytona_config_from_environment(&settings.environment, &settings.clone)
+}
+
+// ACA: no `&settings.clone` — `AcaConfig` has no `skip_clone` (an ACA
+// sandbox always starts from its pre-baked disk image), so
+// `aca_config_from_environment` only needs the environment settings.
+#[cfg(feature = "aca")]
+fn resolve_aca_config(settings: &ResolvedRunSettings) -> AcaConfig {
+    aca_config_from_environment(&settings.environment)
 }
 
 fn resolve_docker_config(
@@ -1995,6 +2039,70 @@ reasoning = false
         assert_eq!(pr_origin_url, None);
     }
 
+    // ACA: mirrors `run_session_new_none_target_forces_empty_daytona_workspace`
+    // above, proving a `provider = "aca"` run resolves through `RunSession::new`
+    // into a real `SandboxSpec::Aca` (T4's fail-closed stub is gone). Unlike
+    // that test, no vault secret is seeded: ACA authenticates via
+    // `azure_identity`, not an API key. `runtime.repo_cloned` is `None` rather
+    // than `Some(false)`: Aca isn't matched by `to_run_sandbox_instance`'s
+    // Docker/Daytona-specific arms and falls through to its generic fallback.
+    #[cfg(feature = "aca")]
+    #[tokio::test]
+    async fn run_session_new_none_target_forces_empty_aca_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let (storage_root, _run_dir) = storage_root_and_run_dir(&temp);
+        let mut settings = settings_from_run_layer(RunLayer {
+            clone: Some(RunCloneLayer {
+                enabled: Some(true),
+                depth:   None,
+            }),
+            ..RunLayer::default()
+        });
+        settings.run.environment.provider = EnvironmentProvider::Aca;
+        settings.run.environment.image.docker = None;
+        let (persisted, store) = persisted_workflow_with_settings_and_target(
+            MINIMAL_DOT,
+            &storage_root,
+            settings,
+            Some(RunTarget::None {}),
+        )
+        .await;
+        let emitter = Arc::new(Emitter::new(fixtures::RUN_1));
+        let registry = Arc::new(test_registry());
+
+        let session = RunSession::new(
+            &persisted,
+            test_start_services(&store, &storage_root, emitter, registry).await,
+        )
+        .await
+        .unwrap();
+
+        let RunSession {
+            sandbox,
+            sandbox_env,
+            pr_origin_url,
+            ..
+        } = session;
+        let runtime = sandbox
+            .to_run_sandbox_instance(&MockSandbox::linux(), fixtures::RUN_1)
+            .runtime;
+        assert_eq!(runtime.repo_cloned, None);
+        assert_eq!(runtime.clone_origin_url, None);
+        assert_eq!(runtime.clone_branch, None);
+        let SandboxSpec::Aca {
+            clone_origin_url,
+            clone_branch,
+            ..
+        } = sandbox
+        else {
+            panic!("none target should retain the selected Aca provider");
+        };
+        assert_eq!(clone_origin_url, None);
+        assert_eq!(clone_branch, None);
+        assert_eq!(sandbox_env.origin_url, None);
+        assert_eq!(pr_origin_url, None);
+    }
+
     #[tokio::test]
     async fn run_session_new_rejects_persisted_none_target_with_local_provider() {
         let temp = tempfile::tempdir().unwrap();
@@ -2061,7 +2169,14 @@ reasoning = false
 
     #[tokio::test]
     async fn run_session_new_folder_target_rejects_clone_based_providers() {
-        for provider in [EnvironmentProvider::Docker, EnvironmentProvider::Daytona] {
+        // ACA: added to this loop — the folder/clone-based rejection below
+        // fires before the (feature-gated) provider-specific dispatch match,
+        // so this covers Aca even when the `aca` cargo feature is off.
+        for provider in [
+            EnvironmentProvider::Docker,
+            EnvironmentProvider::Daytona,
+            EnvironmentProvider::Aca,
+        ] {
             let temp = tempfile::tempdir().unwrap();
             let (storage_root, _run_dir) = storage_root_and_run_dir(&temp);
             let (_, canonical_text) = canonical_folder(&temp);

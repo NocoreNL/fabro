@@ -25,6 +25,14 @@ pub use client::{
 mod sandbox;
 pub use sandbox::AcaSandbox;
 
+// ACA: fixed data-plane token audience (Task 2's capture doc), distinct from
+// the region-specific data-plane host `AcaClient` talks to. Shared (not
+// duplicated) between `SandboxSpec::Aca::build` (`sandbox_spec.rs`, the
+// run-dispatch path) and `fabro-server`'s `build_sandbox_provider_registry`
+// (the managed-sandboxes registry path), which both need to build an
+// `EntraTokenSource` for the exact same audience.
+pub const ACA_TOKEN_AUDIENCE: &str = "https://management.azuredevcompute.io";
+
 // ACA: creation params for an ACA sandbox. Mirrors `DaytonaConfig`'s role;
 // `AcaSandbox::new` builds the live handle from these (see `sandbox.rs`).
 #[derive(Clone, Debug)]

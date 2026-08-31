@@ -15,6 +15,12 @@ doctest = false
 
 [features]
 test-support = ["fabro-auth/test-support", "fabro-store/test-support"]
+# ACA: gates this crate's own `SandboxSpec::Aca` construction in
+# src/operations/start.rs; forwards to fabro-sandbox's own `aca` feature
+# (daytona is always on for this crate today, so there was no prior
+# precedent for this forwarding pattern — mirrors fabro-server's identical
+# comment on its own `aca` feature).
+aca = ["fabro-sandbox/aca"]
 
 [lints]
 workspace = true

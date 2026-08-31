@@ -3,6 +3,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+// ACA: `aca_account_from_process_env` (used by `SandboxSpec::Aca::build` to
+// build its own standalone provider, mirroring the Daytona run-dispatch
+// path's own env fallback) reads the same four account-scoping vars the
+// server's `aca_account_from_env` reads via `EnvLookup`.
+use fabro_static::EnvVars;
 use fabro_types::{
     SandboxInfo, SandboxNetwork, SandboxProviderKind, SandboxResources, SandboxState,
     SandboxTimestamps,
@@ -84,7 +89,13 @@ impl AcaSandboxProvider {
     /// [`AcaAccount`] (no per-call override exists for it: none of
     /// `SandboxCreateSpec::Aca`'s `AcaConfig`, nor `get`/`list`/`delete`'s
     /// bare id, carry a subscription).
-    fn client_for(
+    ///
+    /// ACA: `pub(crate)` (not private) so `sandbox_spec.rs`'s
+    /// `SandboxSpec::Aca::build` can build a second client scoped to the same
+    /// region/resource-group/sandbox-group `create` just used, once it has
+    /// the sandbox id `create` returned (see that arm's comment for why one
+    /// `AcaClient` can't simply be reused across the two call sites).
+    pub(crate) fn client_for(
         &self,
         region: &str,
         resource_group: &str,
@@ -114,6 +125,27 @@ impl AcaSandboxProvider {
             &self.account.sandbox_group,
         )
     }
+}
+
+// ACA: `SandboxSpec::Aca::build` (the run-dispatch path, in `sandbox_spec.rs`)
+// has no `EnvLookup`/vault plumbing threaded down to it — unlike the server's
+// `build_sandbox_provider_registry`, which reads these same four vars via an
+// injected `EnvLookup` for testability. This mirrors `daytona/mod.rs`'s
+// `resolve_daytona_api_key`: a standalone construction path falls back to the
+// documented process env directly. Returns `None` (not an error) when any of
+// the four is unset, exactly like the server's own `aca_account_from_env`;
+// the caller turns that into a fail-closed error.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "Standalone ACA sandbox construction falls back to the documented process env vars."
+)]
+pub(crate) fn aca_account_from_process_env() -> Option<AcaAccount> {
+    Some(AcaAccount {
+        subscription:   std::env::var(EnvVars::ACA_SUBSCRIPTION_ID).ok()?,
+        resource_group: std::env::var(EnvVars::ACA_RESOURCE_GROUP).ok()?,
+        sandbox_group:  std::env::var(EnvVars::ACA_SANDBOX_GROUP).ok()?,
+        region:         std::env::var(EnvVars::ACA_REGION).ok()?,
+    })
 }
 
 #[async_trait]
