@@ -148,6 +148,11 @@ pub enum SandboxState {
 /// nothing in create/get/list/delete (this task) or exec/fs/lifecycle
 /// (Task 7) needs their contents. A later task can add them if a caller
 /// needs them.
+///
+/// `resume`'s response is a full Sandbox resource too (per the capture doc),
+/// but [`AcaClient::resume`] follows the Task-7 brief's interface and
+/// returns `()` on success rather than parsing it here — a caller that needs
+/// the fresh state can follow up with [`AcaClient::get_sandbox`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SandboxResource {
@@ -172,6 +177,94 @@ pub struct SandboxResource {
     #[serde(default)]
     pub snapshot_id: Option<String>,
 }
+
+// --- Task 7: exec/fs/lifecycle/egress shapes --------------------------
+
+/// Body of `POST .../executeShellCommand`.
+///
+/// `command` is sent exactly as given by the caller — any `/bin/bash -c`
+/// wrapping is Task 8's (`AcaSandbox`) responsibility, not this client's
+/// (see the capture doc's **exec** section).
+#[derive(Debug, Clone, Serialize)]
+struct ExecRequest<'a> {
+    command: &'a str,
+}
+
+/// Response of `POST .../executeShellCommand`.
+///
+/// Field names are exact per the capture doc's **exec** section: no
+/// streaming, a single synchronous/buffered exec.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcaExecResponse {
+    pub stdout:    String,
+    pub stderr:    String,
+    pub exit_code: i32,
+    /// Wall time in milliseconds.
+    pub execution_time_ms: u64,
+}
+
+/// Per-entry shape returned by both `fs stat` (single entry) and `fs ls`
+/// (`entries: array<FileStat>`) — see the capture doc's **fs stat**/**fs
+/// ls** sections, which document the identical per-entry shape.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcaFileStat {
+    pub name:          String,
+    pub path:          String,
+    pub is_dir:        bool,
+    pub is_symlink:    bool,
+    /// POSIX file mode bits, decimal (e.g. `420` == octal `0644`).
+    pub mode:          u32,
+    /// Unix epoch **seconds** (per the capture doc; not milliseconds).
+    pub modified_time: i64,
+    pub size:          u64,
+}
+
+/// Body of `GET .../files/list` — `fs ls`'s response wrapper around
+/// [`AcaFileStat`] entries. The doc also echoes `path` back but no caller
+/// needs it, so — like the unmodeled always-empty [`SandboxResource`]
+/// fields — it's left out; unrecognized fields don't block deserialization.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FsListResponse {
+    entries: Vec<AcaFileStat>,
+}
+
+/// One `hostRules` entry in an egress-policy request/response (capture
+/// doc's **egress set** section).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EgressHostRule {
+    action:  String,
+    pattern: String,
+}
+
+/// Body of `POST .../egresspolicy`.
+///
+/// Unlike the *response* (which nests this same shape again under an
+/// `http` sub-object per the capture doc), the *request* body is flat —
+/// [`AcaClient::set_egress`] doesn't parse the response at all (matching
+/// the Task-7 brief's `-> crate::Result<()>` signature), so no `http`
+/// nesting needs modeling here.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EgressSetRequest {
+    default_action:     String,
+    host_rules:         Vec<EgressHostRule>,
+    traffic_inspection: String,
+}
+
+/// Empty JSON object body (`{}`) — the capture doc's exact request body for
+/// both `stop` and `resume`.
+#[expect(
+    clippy::empty_structs_with_brackets,
+    reason = "the braces are load-bearing: serde serializes a braced empty struct as `{}`, \
+              matching the capture doc's exact stop/resume request body, whereas a unit \
+              struct (`struct EmptyRequest;`) would serialize as `null` instead"
+)]
+#[derive(Debug, Clone, Serialize)]
+struct EmptyRequest {}
 
 // --- error mapping ----------------------------------------------------
 
@@ -280,7 +373,7 @@ impl AcaClient {
         request: CreateSandboxRequest,
     ) -> crate::Result<SandboxResource> {
         let url = self.sandboxes_url();
-        let response = self.send(Method::PUT, url, Some(&request)).await?;
+        let response = self.send(Method::PUT, url, &[], Some(&request)).await?;
         let body = Self::ok_body(response, "create sandbox").await?;
         Self::decode(&body, "create sandbox")
     }
@@ -290,7 +383,7 @@ impl AcaClient {
     /// a deleted/never-existent sandbox 404s.
     pub async fn get_sandbox(&self, id: &str) -> crate::Result<Option<SandboxResource>> {
         let url = self.sandbox_url(id);
-        let response = self.send::<()>(Method::GET, url, None).await?;
+        let response = self.send::<()>(Method::GET, url, &[], None).await?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -301,7 +394,7 @@ impl AcaClient {
     /// `GET .../sandboxes` — bare JSON array, `[]` when empty.
     pub async fn list_sandboxes(&self) -> crate::Result<Vec<SandboxResource>> {
         let url = self.sandboxes_url();
-        let response = self.send::<()>(Method::GET, url, None).await?;
+        let response = self.send::<()>(Method::GET, url, &[], None).await?;
         let body = Self::ok_body(response, "list sandboxes").await?;
         Self::decode(&body, "list sandboxes")
     }
@@ -311,8 +404,161 @@ impl AcaClient {
     /// delete was accepted, not that the sandbox is gone yet.
     pub async fn delete_sandbox(&self, id: &str) -> crate::Result<()> {
         let url = self.sandbox_url(id);
-        let response = self.send::<()>(Method::DELETE, url, None).await?;
+        let response = self.send::<()>(Method::DELETE, url, &[], None).await?;
         Self::ok_body(response, "delete sandbox").await?;
+        Ok(())
+    }
+
+    /// `POST .../executeShellCommand` — run a shell command synchronously.
+    ///
+    /// `command` is sent exactly as given; wrapping it for e.g. `/bin/bash
+    /// -c` semantics is Task 8's (`AcaSandbox`) job, not this client's (see
+    /// the capture doc's **exec** section and [`ExecRequest`]'s docs).
+    pub async fn exec(&self, sandbox_id: &str, command: &str) -> crate::Result<AcaExecResponse> {
+        let url = self.sandbox_action_url(sandbox_id, "executeShellCommand");
+        let request = ExecRequest { command };
+        let response = self.send(Method::POST, url, &[], Some(&request)).await?;
+        let body = Self::ok_body(response, "exec").await?;
+        Self::decode(&body, "exec")
+    }
+
+    /// `PUT .../files?path=...&createDirs=...` — write raw bytes to a file.
+    ///
+    /// Unlike every other endpoint on this client, the request body here is
+    /// **raw octet-stream bytes, not JSON** (capture doc's **fs write**
+    /// section), so this bypasses [`Self::send`]'s `.json()` body encoding.
+    /// `path`/`createDirs` are query parameters, not part of the body;
+    /// `.query()` percent-encodes `path` for us (no need for the `url`
+    /// crate here).
+    pub async fn fs_write(
+        &self,
+        sandbox_id: &str,
+        path: &str,
+        bytes: &[u8],
+        create_dirs: bool,
+    ) -> crate::Result<()> {
+        let url = self.sandbox_action_url(sandbox_id, "files");
+        let create_dirs = create_dirs.to_string();
+        let query = [("path", path), ("createDirs", create_dirs.as_str())];
+        let builder = self
+            .authenticated_request(Method::PUT, url, &query)
+            .await?;
+        let response = builder
+            .header("content-type", "application/octet-stream")
+            .body(bytes.to_vec())
+            .send()
+            .await
+            .map_err(|err| crate::Error::context("ACA data-plane request failed", err))?;
+        Self::ok_body(response, "fs write").await?;
+        Ok(())
+    }
+
+    /// `GET .../files?path=...` — read a file's raw bytes.
+    ///
+    /// The response is **raw bytes, not JSON** (capture doc's **fs cat**
+    /// section), so this reads `.bytes()` rather than going through
+    /// [`Self::ok_body`]'s `.text()`.
+    pub async fn fs_cat(&self, sandbox_id: &str, path: &str) -> crate::Result<Vec<u8>> {
+        let url = self.sandbox_action_url(sandbox_id, "files");
+        let query = [("path", path)];
+        let response = self.send::<()>(Method::GET, url, &query, None).await?;
+        Self::ok_bytes(response, "fs cat").await
+    }
+
+    /// `GET .../files/stat?path=...` — returns `Ok(None)` on 404 (no stable
+    /// `SandboxNotFound`-style body was captured for this endpoint, but the
+    /// Task-7 brief specifies 404 -> `None` for existence checks).
+    pub async fn fs_stat(
+        &self,
+        sandbox_id: &str,
+        path: &str,
+    ) -> crate::Result<Option<AcaFileStat>> {
+        let url = self.sandbox_action_url(sandbox_id, "files/stat");
+        let query = [("path", path)];
+        let response = self.send::<()>(Method::GET, url, &query, None).await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let body = Self::ok_body(response, "fs stat").await?;
+        Self::decode(&body, "fs stat").map(Some)
+    }
+
+    /// `GET .../files/list?path=...` — list directory entries.
+    pub async fn fs_ls(&self, sandbox_id: &str, path: &str) -> crate::Result<Vec<AcaFileStat>> {
+        let url = self.sandbox_action_url(sandbox_id, "files/list");
+        let query = [("path", path)];
+        let response = self.send::<()>(Method::GET, url, &query, None).await?;
+        let body = Self::ok_body(response, "fs ls").await?;
+        Self::decode::<FsListResponse>(&body, "fs ls").map(|parsed| parsed.entries)
+    }
+
+    /// `POST .../egresspolicy` — set the sandbox's network egress policy.
+    ///
+    /// `rules` entries use the CLI's `pattern:Action` shorthand (e.g.
+    /// `"github.com:Allow"`, matching the capture doc's `aca sandbox egress
+    /// set --rule=github.com:Allow` example); a rule without a `:` falls
+    /// back to `default_action`. The response nests this same policy again
+    /// under an `http` sub-object (capture doc's **egress set** section),
+    /// but this method doesn't parse the response at all — only the
+    /// captured request shape is replicated, per the Task-7 brief's `->
+    /// crate::Result<()>` signature.
+    pub async fn set_egress(
+        &self,
+        sandbox_id: &str,
+        default_action: &str,
+        rules: &[String],
+        inspection: &str,
+    ) -> crate::Result<()> {
+        let url = self.sandbox_action_url(sandbox_id, "egresspolicy");
+        let host_rules = rules
+            .iter()
+            .map(|rule| match rule.split_once(':') {
+                Some((pattern, action)) => EgressHostRule {
+                    action:  action.to_string(),
+                    pattern: pattern.to_string(),
+                },
+                None => EgressHostRule {
+                    action:  default_action.to_string(),
+                    pattern: rule.clone(),
+                },
+            })
+            .collect();
+        let request = EgressSetRequest {
+            default_action: default_action.to_string(),
+            host_rules,
+            traffic_inspection: inspection.to_string(),
+        };
+        let response = self.send(Method::POST, url, &[], Some(&request)).await?;
+        Self::ok_body(response, "set egress policy").await?;
+        Ok(())
+    }
+
+    /// `POST .../stop` — suspend the sandbox.
+    ///
+    /// The response is a **Snapshot** resource, not a Sandbox (capture
+    /// doc's **stop (suspend)** section) — this treats any 2xx as success
+    /// and never attempts to decode the body as a [`SandboxResource`].
+    pub async fn suspend(&self, sandbox_id: &str) -> crate::Result<()> {
+        let url = self.sandbox_action_url(sandbox_id, "stop");
+        let response = self
+            .send(Method::POST, url, &[], Some(&EmptyRequest {}))
+            .await?;
+        Self::ok_body(response, "suspend sandbox").await?;
+        Ok(())
+    }
+
+    /// `POST .../resume` — resume a suspended sandbox.
+    ///
+    /// The response is a full Sandbox resource (capture doc's **resume**
+    /// section), but — per the Task-7 brief's `-> crate::Result<()>`
+    /// signature — this only confirms success; a caller that needs the
+    /// fresh state can follow up with [`Self::get_sandbox`].
+    pub async fn resume(&self, sandbox_id: &str) -> crate::Result<()> {
+        let url = self.sandbox_action_url(sandbox_id, "resume");
+        let response = self
+            .send(Method::POST, url, &[], Some(&EmptyRequest {}))
+            .await?;
+        Self::ok_body(response, "resume sandbox").await?;
         Ok(())
     }
 
@@ -335,28 +581,63 @@ impl AcaClient {
         url
     }
 
-    /// Send one authenticated request. `GET` additionally sends
-    /// `accept: application/json` (the capture doc's **Common headers**
-    /// section notes `DELETE` captured live did *not* send `accept`, only
-    /// `authorization`+`user-agent`+`x-ms-client-request-id`; `PUT`/`POST`
-    /// get `content-type: application/json` automatically from `.json()`).
-    async fn send<B: Serialize + ?Sized>(
+    /// URL for a sub-resource/action under one sandbox, e.g.
+    /// `.../sandboxes/{id}/executeShellCommand` or
+    /// `.../sandboxes/{id}/files/stat`.
+    fn sandbox_action_url(&self, id: &str, action: &str) -> Url {
+        let mut url = self.base.clone();
+        url.set_path(&format!("{}/{id}/{action}", self.sandboxes_path()));
+        url
+    }
+
+    /// Build one authenticated request, with `api-version` plus any
+    /// endpoint-specific `extra_query` pairs (e.g. `fs`'s `path`/
+    /// `createDirs`) attached. `.query()` percent-encodes values for us, so
+    /// callers pass raw (unencoded) strings — no need for the `url` crate
+    /// here (Task 6 removed it as an unused dep; this client doesn't need
+    /// it back).
+    ///
+    /// `GET` additionally sends `accept: application/json` (the capture
+    /// doc's **Common headers** section notes `DELETE` captured live did
+    /// *not* send `accept`, only
+    /// `authorization`+`user-agent`+`x-ms-client-request-id`). Callers that
+    /// send a body add their own `content-type` — [`Self::send`] uses
+    /// `.json()` (sets `application/json`); [`Self::fs_write`] sets
+    /// `application/octet-stream` itself, since its body is raw bytes.
+    async fn authenticated_request(
         &self,
         method: Method,
         url: Url,
-        body: Option<&B>,
-    ) -> crate::Result<Response> {
+        extra_query: &[(&str, &str)],
+    ) -> crate::Result<fabro_http::RequestBuilder> {
         let token = self.token.token().await?;
         let mut builder = self
             .http
             .request(method.clone(), url)
             .query(&[("api-version", API_VERSION)])
+            .query(extra_query)
             .bearer_auth(token)
             .header("x-ms-client-request-id", Uuid::new_v4().to_string())
             .header("user-agent", USER_AGENT);
         if method == Method::GET {
             builder = builder.header("accept", "application/json");
         }
+        Ok(builder)
+    }
+
+    /// Send one authenticated JSON request (or no body, for `GET`/`DELETE`).
+    /// See [`Self::authenticated_request`] for the shared header/query
+    /// setup.
+    async fn send<B: Serialize + ?Sized>(
+        &self,
+        method: Method,
+        url: Url,
+        extra_query: &[(&str, &str)],
+        body: Option<&B>,
+    ) -> crate::Result<Response> {
+        let mut builder = self
+            .authenticated_request(method, url, extra_query)
+            .await?;
         if let Some(body) = body {
             builder = builder.json(body);
         }
@@ -383,6 +664,32 @@ impl AcaClient {
         }
     }
 
+    /// Like [`Self::ok_body`], but for endpoints whose successful response
+    /// is raw bytes rather than text/JSON (`fs cat` — capture doc's **fs
+    /// cat** section: `content-type: application/octet-stream`, not JSON).
+    /// The error path still reads the body as text, matching every other
+    /// endpoint's `problem+json` error shape.
+    async fn ok_bytes(response: Response, op: &'static str) -> crate::Result<Vec<u8>> {
+        let status = response.status();
+        if status.is_success() {
+            response
+                .bytes()
+                .await
+                .map(|bytes| bytes.to_vec())
+                .map_err(|err| {
+                    crate::Error::context(format!("Failed to read ACA {op} response body"), err)
+                })
+        } else {
+            let body = response.text().await.map_err(|err| {
+                crate::Error::context(format!("Failed to read ACA {op} response body"), err)
+            })?;
+            Err(crate::Error::context(
+                format!("ACA {op} request failed"),
+                map_status(status, &body),
+            ))
+        }
+    }
+
     fn decode<T: for<'de> Deserialize<'de>>(body: &str, op: &'static str) -> crate::Result<T> {
         serde_json::from_str(body)
             .map_err(|err| crate::Error::context(format!("Failed to decode ACA {op} response"), err))
@@ -393,7 +700,7 @@ impl AcaClient {
 mod tests {
     use std::sync::Arc;
 
-    use httpmock::Method::{DELETE, GET, PUT};
+    use httpmock::Method::{DELETE, GET, POST, PUT};
     use httpmock::MockServer;
 
     use super::*;
@@ -411,6 +718,10 @@ mod tests {
 
     fn sandbox_path(id: &str) -> String {
         format!("{}/{id}", sandboxes_path())
+    }
+
+    fn sandbox_action_path(id: &str, action: &str) -> String {
+        format!("{}/{action}", sandbox_path(id))
     }
 
     fn test_client(server: &MockServer) -> AcaClient {
@@ -738,6 +1049,349 @@ mod tests {
             .get_sandbox("sbx-1")
             .await
             .expect("get sandbox should succeed");
+
+        mock.assert_async().await;
+    }
+
+    // --- Task 7: exec/fs/lifecycle/egress -------------------------------
+
+    fn file_stat_body(name: &str, path: &str, is_dir: bool, size: u64) -> serde_json::Value {
+        serde_json::json!({
+            "isDir": is_dir,
+            "isSymlink": false,
+            "mode": 420,
+            "modifiedTime": 1_788_186_744_i64,
+            "name": name,
+            "path": path,
+            "size": size,
+        })
+    }
+
+    fn snapshot_body(snapshot_id: &str, sandbox_id: &str) -> serde_json::Value {
+        // A **Snapshot** resource — the `stop` response shape (capture doc's
+        // **stop (suspend)** section). Deliberately has no `state` field, so
+        // a test asserting `suspend()` against this body proves the client
+        // never tries to parse it as a `SandboxResource`.
+        serde_json::json!({
+            "createdAtUtc": "2026-08-01T00:00:00Z",
+            "id": snapshot_id,
+            "labels": {},
+            "resources": { "cpu": "1000m", "disk": "20480Mi", "memory": "2048Mi" },
+            "sandboxId": sandbox_id,
+            "sizeInMB": 44,
+            "vmmType": "cloudhypervisor",
+        })
+    }
+
+    #[tokio::test]
+    async fn exec_sends_command_verbatim_and_parses_response() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path(sandbox_action_path("sbx-1", "executeShellCommand"))
+                    .query_param("api-version", API_VERSION)
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    // No `/bin/bash -c` wrapping: the exact command string
+                    // is expected verbatim, shell metacharacters and all —
+                    // that wrapping is Task 8's job, not this client's.
+                    .json_body(serde_json::json!({ "command": "printf hi && echo done" }));
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "executionTimeMs": 28,
+                        "exitCode": 0,
+                        "stderr": "",
+                        "stdout": "hi\ndone\n",
+                    }));
+            })
+            .await;
+
+        let client = test_client(&server);
+        let result = client
+            .exec("sbx-1", "printf hi && echo done")
+            .await
+            .expect("exec should succeed");
+
+        assert_eq!(result.stdout, "hi\ndone\n");
+        assert_eq!(result.stderr, "");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.execution_time_ms, 28);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn exec_maps_409_to_not_running() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path(sandbox_action_path("sbx-1", "executeShellCommand"));
+                then.status(409)
+                    .header("content-type", "application/problem+json")
+                    .json_body(not_running_body());
+            })
+            .await;
+
+        let client = test_client(&server);
+        let error = client
+            .exec("sbx-1", "true")
+            .await
+            .expect_err("409 should be an error");
+
+        let source = std::error::Error::source(&error).expect("error should carry a source");
+        let api_error = source
+            .downcast_ref::<AcaApiError>()
+            .expect("source should be AcaApiError");
+        assert!(matches!(api_error, AcaApiError::NotRunning));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fs_write_sends_octet_stream_body_and_query_params() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(PUT)
+                    .path(sandbox_action_path("sbx-1", "files"))
+                    .query_param("api-version", API_VERSION)
+                    .query_param("path", "/workspace/test.txt")
+                    .query_param("createDirs", "true")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/octet-stream")
+                    .body("hello world");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({ "bytesWritten": 11, "success": true }));
+            })
+            .await;
+
+        let client = test_client(&server);
+        client
+            .fs_write("sbx-1", "/workspace/test.txt", b"hello world", true)
+            .await
+            .expect("fs write should succeed");
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fs_cat_returns_raw_bytes_not_json() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path(sandbox_action_path("sbx-1", "files"))
+                    .query_param("api-version", API_VERSION)
+                    .query_param("path", "/workspace/test.txt")
+                    .header("authorization", "Bearer test-token");
+                then.status(200)
+                    .header("content-type", "application/octet-stream")
+                    .body("raw file bytes");
+            })
+            .await;
+
+        let client = test_client(&server);
+        let bytes = client
+            .fs_cat("sbx-1", "/workspace/test.txt")
+            .await
+            .expect("fs cat should succeed");
+
+        assert_eq!(bytes, b"raw file bytes".to_vec());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fs_stat_returns_some_on_200() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path(sandbox_action_path("sbx-1", "files/stat"))
+                    .query_param("path", "/workspace/test.txt");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(file_stat_body("test.txt", "/workspace/test.txt", false, 24));
+            })
+            .await;
+
+        let client = test_client(&server);
+        let stat = client
+            .fs_stat("sbx-1", "/workspace/test.txt")
+            .await
+            .expect("fs stat should succeed")
+            .expect("stat should be present");
+
+        assert_eq!(stat.name, "test.txt");
+        assert_eq!(stat.path, "/workspace/test.txt");
+        assert!(!stat.is_dir);
+        assert!(!stat.is_symlink);
+        assert_eq!(stat.mode, 420);
+        assert_eq!(stat.modified_time, 1_788_186_744);
+        assert_eq!(stat.size, 24);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fs_stat_returns_none_on_404() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(GET).path(sandbox_action_path("sbx-1", "files/stat"));
+                then.status(404)
+                    .header("content-type", "application/problem+json")
+                    .json_body(not_found_body());
+            })
+            .await;
+
+        let client = test_client(&server);
+        let stat = client
+            .fs_stat("sbx-1", "/workspace/missing.txt")
+            .await
+            .expect("404 on fs stat should not be an error");
+
+        assert!(stat.is_none());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fs_ls_returns_entries() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path(sandbox_action_path("sbx-1", "files/list"))
+                    .query_param("path", "/workspace");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "entries": [file_stat_body("test.txt", "/workspace/test.txt", false, 24)],
+                        "path": "/workspace",
+                    }));
+            })
+            .await;
+
+        let client = test_client(&server);
+        let entries = client
+            .fs_ls("sbx-1", "/workspace")
+            .await
+            .expect("fs ls should succeed");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "test.txt");
+        assert_eq!(entries[0].size, 24);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn suspend_treats_snapshot_response_as_success() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path(sandbox_action_path("sbx-1", "stop"))
+                    .json_body(serde_json::json!({}));
+                // The response is a Snapshot, not a Sandbox — no `state`
+                // field at all. `suspend()` must not try to decode it as a
+                // `SandboxResource`.
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(snapshot_body("snap-1", "sbx-1"));
+            })
+            .await;
+
+        let client = test_client(&server);
+        client
+            .suspend("sbx-1")
+            .await
+            .expect("suspend should treat the Snapshot 2xx as success");
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn resume_returns_ok_on_200() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path(sandbox_action_path("sbx-1", "resume"))
+                    .json_body(serde_json::json!({}));
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(sandbox_body("sbx-1", "Running"));
+            })
+            .await;
+
+        let client = test_client(&server);
+        client.resume("sbx-1").await.expect("resume should succeed");
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn set_egress_sends_traffic_inspection_and_nested_host_rules() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path(sandbox_action_path("sbx-1", "egresspolicy"))
+                    .header("authorization", "Bearer test-token")
+                    .json_body(serde_json::json!({
+                        "defaultAction": "Deny",
+                        "hostRules": [ { "action": "Allow", "pattern": "github.com" } ],
+                        "trafficInspection": "Full",
+                    }));
+                // The response nests the same policy again under `http`
+                // (capture doc's **egress set** section) — `set_egress`
+                // doesn't parse this, only the request shape is asserted.
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "defaultAction": "Deny",
+                        "hostRules": [ { "action": "Allow", "pattern": "github.com" } ],
+                        "http": {
+                            "defaultAction": "Deny",
+                            "hostRules": [ { "action": "Allow", "pattern": "github.com" } ],
+                            "trafficInspection": "Full",
+                        },
+                        "trafficInspection": "Full",
+                    }));
+            })
+            .await;
+
+        let client = test_client(&server);
+        client
+            .set_egress("sbx-1", "Deny", &["github.com:Allow".to_string()], "Full")
+            .await
+            .expect("set egress should succeed");
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn set_egress_rule_without_colon_falls_back_to_default_action() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path(sandbox_action_path("sbx-1", "egresspolicy"))
+                    .json_body(serde_json::json!({
+                        "defaultAction": "Allow",
+                        "hostRules": [ { "action": "Allow", "pattern": "example.com" } ],
+                        "trafficInspection": "None",
+                    }));
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({}));
+            })
+            .await;
+
+        let client = test_client(&server);
+        client
+            .set_egress("sbx-1", "Allow", &["example.com".to_string()], "None")
+            .await
+            .expect("set egress should succeed");
 
         mock.assert_async().await;
     }
