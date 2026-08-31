@@ -4,6 +4,9 @@
 mod auth;
 pub use auth::{EntraTokenSource, TokenSource};
 
+mod client;
+pub use client::{AcaClient, AcaApiError};
+
 // ACA: creation params for an ACA sandbox. Mirrors `DaytonaConfig`'s role;
 // real sandbox construction against these lands in Task 8.
 #[derive(Clone, Debug)]
