@@ -1,9 +1,11 @@
 //! ACA: `Sandbox` trait implementation.
 //!
-//! Task 8 begins the `impl Sandbox for AcaSandbox` block: command execution
+//! Task 8 began the `impl Sandbox for AcaSandbox` block: command execution
 //! (wrapped as non-login `/bin/bash -c`), buffered-then-replay streaming, and
-//! the shared `BASH_PROBE_SCRIPT` readiness gate. File/grep/cleanup/etc. are
-//! stubbed here and land in Tasks 9-11.
+//! the shared `BASH_PROBE_SCRIPT` readiness gate. Task 9 adds file
+//! operations (delegating to [`AcaClient`]'s `fs_*` endpoints) and `grep`
+//! (via exec, since ACA has no native search endpoint). `cleanup`/git/setup
+//! remain stubbed here and land in Tasks 10-11.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -13,12 +15,13 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use fabro_types::CommandTermination;
-use tokio::time;
+use tokio::sync::OnceCell;
+use tokio::{fs, time};
 use tokio_util::sync::CancellationToken;
 
 use crate::aca::{AcaClient, AcaConfig};
 use crate::sandbox::{
-    BASH_ENV_VAR, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, replay_exec_result,
+    BASH_ENV_VAR, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, replay_exec_result, resolve_path,
     validate_bash_probe,
 };
 use crate::{
@@ -31,8 +34,8 @@ const ACA_BASH_REMEDIATION: &str = "ACA sandboxes require /bin/bash for every co
      `sh` fallback; use a disk image that provides bash, such as `ubuntu`.";
 
 /// Message returned by every trait method this task leaves unimplemented.
-/// Tasks 9-11 replace these stubs with real file/grep/cleanup behavior.
-const NOT_YET_IMPLEMENTED: &str = "aca: not yet implemented (task 9/10/11)";
+/// Tasks 10-11 replace these stubs with real cleanup/git/setup behavior.
+const NOT_YET_IMPLEMENTED: &str = "aca: not yet implemented (task 10/11)";
 
 /// `Sandbox` implementation over the ACA data-plane REST client
 /// ([`AcaClient`]).
@@ -45,6 +48,10 @@ pub struct AcaSandbox {
     client:     Arc<AcaClient>,
     sandbox_id: String,
     config:     AcaConfig,
+    /// Cached result of probing `rg --version` via exec, so [`Sandbox::grep`]
+    /// only pays for the probe once per sandbox instance. Mirrors
+    /// `daytona/mod.rs`'s `rg_available` field.
+    rg_available: OnceCell<bool>,
 }
 
 impl AcaSandbox {
@@ -53,7 +60,15 @@ impl AcaSandbox {
             client,
             sandbox_id,
             config,
+            rg_available: OnceCell::const_new(),
         }
+    }
+
+    /// Resolve `path` against [`Sandbox::working_directory`]: relative paths
+    /// are joined onto it, absolute paths pass through unchanged. Shared with
+    /// the Daytona/Docker sandboxes via `crate::sandbox::resolve_path`.
+    fn resolve_path(&self, path: &str) -> String {
+        resolve_path(path, self.working_directory())
     }
 
     /// Build the exact `command` string sent to ACA's `executeShellCommand`.
@@ -214,56 +229,189 @@ impl Sandbox for AcaSandbox {
         self.sandbox_id.clone()
     }
 
-    // --- stubs: real behavior lands in Tasks 9-11 ---
-
-    async fn read_file_bytes(&self, _path: &str) -> crate::Result<Vec<u8>> {
-        Err(crate::Error::message(NOT_YET_IMPLEMENTED))
+    async fn read_file_bytes(&self, path: &str) -> crate::Result<Vec<u8>> {
+        let resolved = self.resolve_path(path);
+        self.client.fs_cat(&self.sandbox_id, &resolved).await
     }
 
-    async fn write_file(&self, _path: &str, _content: &str) -> crate::Result<()> {
-        Err(crate::Error::message(NOT_YET_IMPLEMENTED))
+    async fn write_file(&self, path: &str, content: &str) -> crate::Result<()> {
+        let resolved = self.resolve_path(path);
+        // `create_dirs=true` matches the capture doc's note that the
+        // reference CLI always sends `true` for `fs write`; ACA's endpoint
+        // creates missing parent directories server-side, so — unlike
+        // Daytona — no separate `create_folder` call is needed first.
+        self.client
+            .fs_write(&self.sandbox_id, &resolved, content.as_bytes(), true)
+            .await
     }
 
-    async fn delete_file(&self, _path: &str) -> crate::Result<()> {
-        Err(crate::Error::message(NOT_YET_IMPLEMENTED))
+    /// ACA's data-plane capture (`docs/aca-data-plane-api.md`) documents only
+    /// 12 endpoints — write/cat/stat/ls/cp, exec, lifecycle, egress — and
+    /// explicitly notes `fs cp` has "no dedicated ... REST endpoint; it's a
+    /// CLI-side convenience wrapper" over write/cat. No file-delete endpoint
+    /// was ever captured. Rather than fabricate an unverified REST shape,
+    /// this deletes via the same exec transport `grep` uses below, the same
+    /// call-a-real-command approach the capture doc itself takes for `cp`.
+    async fn delete_file(&self, path: &str) -> crate::Result<()> {
+        let resolved = self.resolve_path(path);
+        let cmd = format!("rm -f -- {}", shell_quote(&resolved));
+        let result = self.exec_command(&cmd, 30_000, None, None, None).await?;
+        if result.is_success() {
+            Ok(())
+        } else {
+            Err(crate::Error::message(format!(
+                "Failed to delete file {resolved} (exit {}): {}",
+                result.display_exit_code(),
+                result.stderr
+            )))
+        }
     }
 
-    async fn file_exists(&self, _path: &str) -> crate::Result<bool> {
-        Err(crate::Error::message(NOT_YET_IMPLEMENTED))
+    async fn file_exists(&self, path: &str) -> crate::Result<bool> {
+        let resolved = self.resolve_path(path);
+        Ok(self
+            .client
+            .fs_stat(&self.sandbox_id, &resolved)
+            .await?
+            .is_some())
     }
 
+    /// ACA's `files/list` endpoint (capture doc's **fs ls** section) is
+    /// single-level only — it takes just `path`, with no recursion/depth
+    /// query parameter observed — so this always returns immediate children,
+    /// matching `depth`'s `None`/`Some(1)` semantics. Deeper values are not
+    /// honored (no verified endpoint shape to recurse with); this is a
+    /// documented limitation, not a bug.
     async fn list_directory(
         &self,
-        _path: &str,
+        path: &str,
         _depth: Option<usize>,
     ) -> crate::Result<Vec<DirEntry>> {
-        Err(crate::Error::message(NOT_YET_IMPLEMENTED))
+        let resolved = self.resolve_path(path);
+        let entries = self.client.fs_ls(&self.sandbox_id, &resolved).await?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| DirEntry {
+                name:   entry.name,
+                is_dir: entry.is_dir,
+                size:   if entry.is_dir { None } else { Some(entry.size) },
+            })
+            .collect())
     }
 
+    /// ACA has no native search endpoint, so this shells out via
+    /// [`Sandbox::exec_command`]: `rg` when available (probed once and
+    /// cached in `rg_available`), falling back to `grep -rn`. Mirrors
+    /// `daytona/mod.rs`'s `grep` exactly.
     async fn grep(
         &self,
-        _pattern: &str,
-        _path: &str,
-        _options: &GrepOptions,
+        pattern: &str,
+        path: &str,
+        options: &GrepOptions,
     ) -> crate::Result<Vec<String>> {
-        Err(crate::Error::message(NOT_YET_IMPLEMENTED))
+        let resolved = self.resolve_path(path);
+
+        let use_rg = *self
+            .rg_available
+            .get_or_init(|| async {
+                let result = self
+                    .exec_command("rg --version", 10_000, None, None, None)
+                    .await;
+                matches!(result, Ok(r) if r.is_success())
+            })
+            .await;
+
+        let cmd = if use_rg {
+            let mut cmd = "rg --line-number --no-heading".to_string();
+            if options.case_insensitive {
+                cmd.push_str(" -i");
+            }
+            if let Some(ref glob_filter) = options.glob_filter {
+                let _ = write!(cmd, " --glob {}", shell_quote(glob_filter));
+            }
+            if let Some(max) = options.max_results {
+                let _ = write!(cmd, " --max-count {max}");
+            }
+            let _ = write!(
+                cmd,
+                " -- {} {}",
+                shell_quote(pattern),
+                shell_quote(&resolved)
+            );
+            cmd
+        } else {
+            let mut cmd = "grep -rn".to_string();
+            if options.case_insensitive {
+                cmd.push_str(" -i");
+            }
+            if let Some(ref glob_filter) = options.glob_filter {
+                let _ = write!(cmd, " --include {}", shell_quote(glob_filter));
+            }
+            if let Some(max) = options.max_results {
+                let _ = write!(cmd, " -m {max}");
+            }
+            let _ = write!(
+                cmd,
+                " -- {} {}",
+                shell_quote(pattern),
+                shell_quote(&resolved)
+            );
+            cmd
+        };
+
+        let result = self.exec_command(&cmd, 30_000, None, None, None).await?;
+
+        if result.exit_code == Some(1) {
+            // Both rg and grep exit 1 for no matches.
+            return Ok(Vec::new());
+        }
+        if !result.is_success() {
+            return Err(crate::Error::message(format!(
+                "grep failed (exit {}): {}",
+                result.display_exit_code(),
+                result.stderr
+            )));
+        }
+
+        Ok(result.stdout.lines().map(String::from).collect())
     }
 
     async fn download_file_to_local(
         &self,
-        _remote_path: &str,
-        _local_path: &Path,
+        remote_path: &str,
+        local_path: &Path,
     ) -> crate::Result<()> {
-        Err(crate::Error::message(NOT_YET_IMPLEMENTED))
+        let resolved = self.resolve_path(remote_path);
+        let bytes = self.client.fs_cat(&self.sandbox_id, &resolved).await?;
+
+        if let Some(parent) = local_path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| crate::Error::context("Failed to create parent dirs", e))?;
+        }
+        fs::write(local_path, &bytes).await.map_err(|e| {
+            crate::Error::context(format!("Failed to write {}", local_path.display()), e)
+        })?;
+
+        Ok(())
     }
 
     async fn upload_file_from_local(
         &self,
-        _local_path: &Path,
-        _remote_path: &str,
+        local_path: &Path,
+        remote_path: &str,
     ) -> crate::Result<()> {
-        Err(crate::Error::message(NOT_YET_IMPLEMENTED))
+        let resolved = self.resolve_path(remote_path);
+        let bytes = fs::read(local_path).await.map_err(|e| {
+            crate::Error::context(format!("Failed to read {}", local_path.display()), e)
+        })?;
+
+        self.client
+            .fs_write(&self.sandbox_id, &resolved, &bytes, true)
+            .await
     }
+
+    // --- stub: real behavior lands in Task 10 ---
 
     async fn cleanup(&self) -> crate::Result<()> {
         Err(crate::Error::message(NOT_YET_IMPLEMENTED))
@@ -280,7 +428,7 @@ impl Sandbox for AcaSandbox {
 mod tests {
     use std::sync::Arc;
 
-    use httpmock::Method::POST;
+    use httpmock::Method::{GET, POST, PUT};
     use httpmock::MockServer;
 
     use super::*;
@@ -326,9 +474,25 @@ mod tests {
     }
 
     fn exec_path() -> String {
+        action_path("executeShellCommand")
+    }
+
+    fn action_path(action: &str) -> String {
         format!(
-            "/subscriptions/{SUBSCRIPTION}/resourceGroups/{RESOURCE_GROUP}/sandboxGroups/{SANDBOX_GROUP}/sandboxes/{SANDBOX_ID}/executeShellCommand"
+            "/subscriptions/{SUBSCRIPTION}/resourceGroups/{RESOURCE_GROUP}/sandboxGroups/{SANDBOX_GROUP}/sandboxes/{SANDBOX_ID}/{action}"
         )
+    }
+
+    fn file_stat_body(name: &str, path: &str, is_dir: bool, size: u64) -> serde_json::Value {
+        serde_json::json!({
+            "isDir": is_dir,
+            "isSymlink": false,
+            "mode": 420,
+            "modifiedTime": 1_788_186_744_i64,
+            "name": name,
+            "path": path,
+            "size": size,
+        })
     }
 
     async fn mock_exec_expecting<'a>(
@@ -524,22 +688,358 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stubbed_methods_error_instead_of_panicking() {
+    async fn cleanup_errors_instead_of_panicking() {
         let server = MockServer::start_async().await;
         let sandbox = test_sandbox(&server);
 
-        assert!(sandbox.read_file_bytes("/x").await.is_err());
-        assert!(sandbox.write_file("/x", "y").await.is_err());
-        assert!(sandbox.delete_file("/x").await.is_err());
-        assert!(sandbox.file_exists("/x").await.is_err());
-        assert!(sandbox.list_directory("/x", None).await.is_err());
-        assert!(
-            sandbox
-                .grep("pat", "/x", &GrepOptions::default())
-                .await
-                .is_err()
-        );
         assert!(sandbox.cleanup().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn write_file_resolves_relative_path_and_sends_create_dirs_true() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(PUT)
+                    .path(action_path("files"))
+                    .query_param("path", "/workspace/sub/test.txt")
+                    .query_param("createDirs", "true")
+                    .header("content-type", "application/octet-stream")
+                    .body("hello world");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({ "bytesWritten": 11, "success": true }));
+            })
+            .await;
+        let sandbox = test_sandbox(&server);
+
+        sandbox
+            .write_file("sub/test.txt", "hello world")
+            .await
+            .expect("write_file should succeed");
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn read_file_bytes_returns_fs_cat_bytes_for_absolute_path() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path(action_path("files"))
+                    .query_param("path", "/workspace/test.txt");
+                then.status(200)
+                    .header("content-type", "application/octet-stream")
+                    .body("raw file bytes");
+            })
+            .await;
+        let sandbox = test_sandbox(&server);
+
+        let bytes = sandbox
+            .read_file_bytes("/workspace/test.txt")
+            .await
+            .expect("read_file_bytes should succeed");
+
+        assert_eq!(bytes, b"raw file bytes".to_vec());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn file_exists_true_when_fs_stat_returns_some() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path(action_path("files/stat"))
+                    .query_param("path", "/workspace/test.txt");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(file_stat_body("test.txt", "/workspace/test.txt", false, 24));
+            })
+            .await;
+        let sandbox = test_sandbox(&server);
+
+        let exists = sandbox
+            .file_exists("test.txt")
+            .await
+            .expect("file_exists should succeed");
+
+        assert!(exists);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn file_exists_false_when_fs_stat_returns_404() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(GET).path(action_path("files/stat"));
+                then.status(404)
+                    .header("content-type", "application/problem+json")
+                    .json_body(serde_json::json!({
+                        "detail": "not found",
+                        "errorCode": 1,
+                        "requestId": "req-1",
+                        "status": 404,
+                        "title": "SandboxNotFound",
+                        "traceId": "trace-1",
+                    }));
+            })
+            .await;
+        let sandbox = test_sandbox(&server);
+
+        let exists = sandbox
+            .file_exists("missing.txt")
+            .await
+            .expect("404 should not be an error");
+
+        assert!(!exists);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_directory_maps_fs_ls_entries_to_dir_entry() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path(action_path("files/list"))
+                    .query_param("path", "/workspace");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "entries": [
+                            file_stat_body("test.txt", "/workspace/test.txt", false, 24),
+                            file_stat_body("sub", "/workspace/sub", true, 4096),
+                        ],
+                        "path": "/workspace",
+                    }));
+            })
+            .await;
+        let sandbox = test_sandbox(&server);
+
+        let entries = sandbox
+            .list_directory("/workspace", None)
+            .await
+            .expect("list_directory should succeed");
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "test.txt");
+        assert!(!entries[0].is_dir);
+        assert_eq!(entries[0].size, Some(24));
+        assert_eq!(entries[1].name, "sub");
+        assert!(entries[1].is_dir);
+        assert_eq!(entries[1].size, None);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn delete_file_runs_rm_dash_f_via_exec() {
+        let server = MockServer::start_async().await;
+        let mock = mock_exec_expecting(
+            &server,
+            "env -u BASH_ENV /bin/bash -c 'rm -f -- /workspace/test.txt'",
+            "",
+            "",
+            0,
+        )
+        .await;
+        let sandbox = test_sandbox(&server);
+
+        sandbox
+            .delete_file("test.txt")
+            .await
+            .expect("delete_file should succeed");
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn delete_file_errors_on_nonzero_exit() {
+        let server = MockServer::start_async().await;
+        let _mock = mock_exec_expecting(
+            &server,
+            "env -u BASH_ENV /bin/bash -c 'rm -f -- /workspace/test.txt'",
+            "",
+            "rm: permission denied\n",
+            1,
+        )
+        .await;
+        let sandbox = test_sandbox(&server);
+
+        let error = sandbox
+            .delete_file("test.txt")
+            .await
+            .expect_err("nonzero exit should be an error");
+        assert!(error.to_string().contains("permission denied"));
+    }
+
+    #[tokio::test]
+    async fn download_file_to_local_writes_fs_cat_bytes_to_a_new_nested_path() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path(action_path("files"))
+                    .query_param("path", "/workspace/remote.bin");
+                then.status(200)
+                    .header("content-type", "application/octet-stream")
+                    .body("binary\0content");
+            })
+            .await;
+        let sandbox = test_sandbox(&server);
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let local_path = tempdir.path().join("nested").join("out.bin");
+
+        sandbox
+            .download_file_to_local("remote.bin", &local_path)
+            .await
+            .expect("download_file_to_local should succeed");
+
+        let written = fs::read(&local_path)
+            .await
+            .expect("downloaded file should exist");
+        assert_eq!(written, b"binary\0content".to_vec());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn upload_file_from_local_sends_local_bytes_via_fs_write() {
+        let server = MockServer::start_async().await;
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let local_path = tempdir.path().join("in.bin");
+        fs::write(&local_path, b"local bytes")
+            .await
+            .expect("local file should be written");
+
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(PUT)
+                    .path(action_path("files"))
+                    .query_param("path", "/workspace/remote.bin")
+                    .query_param("createDirs", "true")
+                    .body("local bytes");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({ "bytesWritten": 11, "success": true }));
+            })
+            .await;
+        let sandbox = test_sandbox(&server);
+
+        sandbox
+            .upload_file_from_local(&local_path, "remote.bin")
+            .await
+            .expect("upload_file_from_local should succeed");
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn grep_parses_ripgrep_output_when_rg_is_available() {
+        let server = MockServer::start_async().await;
+        let _rg_probe = mock_exec_expecting(
+            &server,
+            "env -u BASH_ENV /bin/bash -c 'rg --version'",
+            "ripgrep 14.0.0\n",
+            "",
+            0,
+        )
+        .await;
+        let search_mock = mock_exec_expecting(
+            &server,
+            "env -u BASH_ENV /bin/bash -c 'rg --line-number --no-heading -- needle /workspace'",
+            "/workspace/a.txt:3:needle here\n/workspace/b.txt:1:needle again\n",
+            "",
+            0,
+        )
+        .await;
+        let sandbox = test_sandbox(&server);
+
+        let matches = sandbox
+            .grep("needle", "/workspace", &GrepOptions::default())
+            .await
+            .expect("grep should succeed");
+
+        assert_eq!(matches, vec![
+            "/workspace/a.txt:3:needle here".to_string(),
+            "/workspace/b.txt:1:needle again".to_string(),
+        ]);
+        search_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn grep_falls_back_to_grep_when_rg_is_unavailable() {
+        let server = MockServer::start_async().await;
+        let _rg_probe = mock_exec_expecting(
+            &server,
+            "env -u BASH_ENV /bin/bash -c 'rg --version'",
+            "",
+            "command not found: rg\n",
+            127,
+        )
+        .await;
+        // `*.rs` contains a shell metacharacter, so `shell_quote` wraps it in
+        // quotes — build the expected command the same way production code
+        // does rather than hand-guessing the escaping.
+        let inner = format!(
+            "grep -rn -i --include {} -m 5 -- {} {}",
+            shell_quote("*.rs"),
+            shell_quote("needle"),
+            shell_quote("/workspace")
+        );
+        let expected = format!("env -u BASH_ENV /bin/bash -c {}", shell_quote(&inner));
+        let search_mock = mock_exec_expecting(
+            &server,
+            &expected,
+            "/workspace/a.rs:2:needle\n",
+            "",
+            0,
+        )
+        .await;
+        let sandbox = test_sandbox(&server);
+
+        let options = GrepOptions {
+            glob_filter:      Some("*.rs".to_string()),
+            case_insensitive: true,
+            max_results:      Some(5),
+        };
+        let matches = sandbox
+            .grep("needle", "/workspace", &options)
+            .await
+            .expect("grep should succeed");
+
+        assert_eq!(matches, vec!["/workspace/a.rs:2:needle".to_string()]);
+        search_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn grep_returns_empty_vec_on_exit_code_one_no_matches() {
+        let server = MockServer::start_async().await;
+        let _rg_probe = mock_exec_expecting(
+            &server,
+            "env -u BASH_ENV /bin/bash -c 'rg --version'",
+            "ripgrep 14.0.0\n",
+            "",
+            0,
+        )
+        .await;
+        let _search_mock = mock_exec_expecting(
+            &server,
+            "env -u BASH_ENV /bin/bash -c 'rg --line-number --no-heading -- needle /workspace'",
+            "",
+            "",
+            1,
+        )
+        .await;
+        let sandbox = test_sandbox(&server);
+
+        let matches = sandbox
+            .grep("needle", "/workspace", &GrepOptions::default())
+            .await
+            .expect("exit code 1 should not be an error");
+
+        assert!(matches.is_empty());
     }
 
     #[tokio::test]
