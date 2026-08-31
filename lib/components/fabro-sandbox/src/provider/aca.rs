@@ -205,14 +205,43 @@ impl SandboxProvider for AcaSandboxProvider {
                 .to_string()
         };
 
-        client
+        if let Err(egress_err) = client
             .set_egress(
                 &resource.id,
                 &default_action,
                 &config.egress.rules,
                 &inspection,
             )
-            .await?;
+            .await
+        {
+            // ACA: `create_sandbox` above already succeeded, so returning
+            // `egress_err` as-is here would leak the just-created sandbox —
+            // left running and billable with no cleanup or record of it.
+            // Mirror `DaytonaSandbox::cleanup_failed_initialization_sandbox`'s
+            // intent: best-effort delete it before propagating the original
+            // error. The delete's own outcome is only logged, never
+            // returned — a failed cleanup must not mask the egress error the
+            // caller actually needs to act on.
+            if let Err(cleanup_err) = client.delete_sandbox(&resource.id).await {
+                tracing::warn!(
+                    sandbox_id = %resource.id,
+                    cleanup_error = %crate::display_for_log(&cleanup_err),
+                    "ACA sandbox created but egress failed; attempted best-effort delete"
+                );
+            } else {
+                tracing::warn!(
+                    sandbox_id = %resource.id,
+                    "ACA sandbox created but egress failed; attempted best-effort delete"
+                );
+            }
+            return Err(crate::Error::context(
+                format!(
+                    "sandbox '{}' was created but egress policy failed to apply; attempted cleanup",
+                    resource.id
+                ),
+                egress_err,
+            ));
+        }
 
         Ok(sandbox_info_from_resource(
             &resource,
@@ -445,6 +474,63 @@ mod tests {
         assert_eq!(info.working_directory.as_deref(), Some("/workspace"));
         create_mock.assert_calls_async(1).await;
         egress_mock.assert_calls_async(1).await;
+    }
+
+    #[tokio::test]
+    async fn create_deletes_sandbox_when_egress_apply_fails() {
+        let server = MockServer::start_async().await;
+        let create_mock = server
+            .mock_async(|when, then| {
+                when.method(PUT).path(sandboxes_path());
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(sandbox_body("sbx-new", "Running"));
+            })
+            .await;
+        let egress_mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path(format!("{}/egresspolicy", sandbox_path("sbx-new")));
+                then.status(500)
+                    .header("content-type", "application/problem+json")
+                    .json_body(serde_json::json!({
+                        "detail": "Internal error applying egress policy.",
+                        "errorCode": 1,
+                        "requestId": "req-1",
+                        "status": 500,
+                        "title": "InternalError",
+                        "traceId": "trace-1",
+                    }));
+            })
+            .await;
+        let delete_mock = server
+            .mock_async(|when, then| {
+                when.method(DELETE).path(sandbox_path("sbx-new"));
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({}));
+            })
+            .await;
+        let provider = test_provider(&server);
+
+        let err = provider
+            .create(SandboxCreateSpec::Aca {
+                config:           Box::new(test_config()),
+                github_app:       None,
+                run_id:           None,
+                clone_origin_url: None,
+                clone_branch:     None,
+            })
+            .await
+            .expect_err("create should fail when egress apply fails");
+
+        create_mock.assert_calls_async(1).await;
+        egress_mock.assert_calls_async(1).await;
+        delete_mock.assert_calls_async(1).await;
+        assert!(
+            err.to_string().contains("sbx-new"),
+            "error should mention the leaked sandbox's id, got: {err}"
+        );
     }
 
     #[tokio::test]
