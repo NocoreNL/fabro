@@ -11,6 +11,10 @@ doctest = false
 
 [features]
 test-support = ["fabro-store/test-support"]
+# ACA: gates the AcaSandboxProvider registry wiring in src/server.rs; forwards
+# to fabro-sandbox's own `aca` feature (daytona/docker are always on for this
+# crate today, so there was no prior precedent for this forwarding pattern).
+aca = ["fabro-sandbox/aca"]
 
 [[test]]
 name = "it"

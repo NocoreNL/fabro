@@ -55,7 +55,7 @@ pub use git_retry::{
 pub use local::LocalSandbox;
 // ACA:
 #[cfg(feature = "aca")]
-pub use provider::aca::AcaSandboxProvider;
+pub use provider::aca::{AcaAccount, AcaSandboxProvider};
 #[cfg(feature = "daytona")]
 pub use provider::daytona::DaytonaSandboxProvider;
 #[cfg(feature = "docker")]

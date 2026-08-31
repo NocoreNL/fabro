@@ -3,9 +3,24 @@
 
 mod auth;
 pub use auth::{EntraTokenSource, TokenSource};
+// ACA: `FakeTokenSource` is test-only (see its doc comment in `auth.rs`),
+// but Task 13's provider tests (`provider/aca.rs`) build an `AcaClient`
+// through `AcaSandboxProvider` from outside `crate::aca`, so it needs to be
+// reachable crate-wide in test builds, not just from sibling `aca::*` test
+// modules.
+#[cfg(test)]
+pub(crate) use auth::FakeTokenSource;
 
 mod client;
 pub use client::{AcaClient, AcaApiError};
+// ACA: Task 13's provider builds `CreateSandboxRequest` literals and maps
+// `SandboxResource`/`SandboxState` responses to `fabro_types::SandboxInfo`
+// directly (see `provider/aca.rs`), so those client-internal shapes need to
+// be nameable outside `crate::aca` too, not just `AcaClient` itself.
+pub use client::{
+    AutoSuspendPolicy, CreateDiskImage, CreateResources, CreateSandboxRequest, CreateSourcesRef,
+    Lifecycle, SandboxResource, SandboxState,
+};
 
 mod sandbox;
 pub use sandbox::AcaSandbox;
