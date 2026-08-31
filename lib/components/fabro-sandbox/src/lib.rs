@@ -32,6 +32,10 @@ pub mod docker;
 #[cfg(feature = "daytona")]
 pub mod daytona;
 
+// ACA:
+#[cfg(feature = "aca")]
+pub mod aca;
+
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
