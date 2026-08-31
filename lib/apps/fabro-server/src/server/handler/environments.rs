@@ -90,6 +90,8 @@ impl CreateEnvironmentRequest {
                 lifecycle: self.lifecycle,
                 labels:    self.labels,
                 env:       self.env,
+                // ACA: not yet exposed via this API; defaults to inert.
+                aca:       Default::default(),
             },
         })
     }
@@ -106,6 +108,8 @@ impl ReplaceEnvironmentRequest {
             lifecycle: self.lifecycle,
             labels:    self.labels,
             env:       self.env,
+            // ACA: not yet exposed via this API; defaults to inert.
+            aca:       Default::default(),
         })
     }
 }

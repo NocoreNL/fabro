@@ -1,6 +1,8 @@
 pub mod config;
 pub mod error;
-#[cfg(any(feature = "docker", feature = "daytona"))]
+// ACA: aca_config_from_environment lives here too, so this module must also
+// compile when only the `aca` feature is enabled.
+#[cfg(any(feature = "docker", feature = "daytona", feature = "aca"))]
 pub mod from_environment;
 pub mod provider;
 pub mod sandbox;

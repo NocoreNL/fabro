@@ -38,6 +38,8 @@ fn settings(provider: EnvironmentProvider) -> EnvironmentSettings {
         lifecycle: EnvironmentLifecycleSettings::default(),
         labels: HashMap::new(),
         env: HashMap::new(),
+        // ACA:
+        aca: Default::default(),
     }
 }
 

@@ -1,16 +1,16 @@
 use std::path::Path;
 
 use fabro_types::settings::run::{
-    DockerfileSource, EnvironmentImageSettings, EnvironmentLifecycleSettings,
-    EnvironmentNetworkMode, EnvironmentNetworkSettings, EnvironmentProvider,
-    EnvironmentResourcesSettings, EnvironmentSettings, RunEnvironmentSettings,
+    AcaEgressSettings, AcaEnvironmentSettings, DockerfileSource, EnvironmentImageSettings,
+    EnvironmentLifecycleSettings, EnvironmentNetworkMode, EnvironmentNetworkSettings,
+    EnvironmentProvider, EnvironmentResourcesSettings, EnvironmentSettings, RunEnvironmentSettings,
 };
 
 use super::ResolveError;
 use crate::{
-    Combine, EnvironmentDockerfileLayer, EnvironmentImageLayer, EnvironmentLayer,
-    EnvironmentLifecycleLayer, EnvironmentNetworkLayer, EnvironmentResourcesLayer, MergeMap,
-    RunEnvironmentLayer,
+    AcaEgressLayer, AcaEnvironmentLayer, Combine, EnvironmentDockerfileLayer, EnvironmentImageLayer,
+    EnvironmentLayer, EnvironmentLifecycleLayer, EnvironmentNetworkLayer,
+    EnvironmentResourcesLayer, MergeMap, RunEnvironmentLayer,
 };
 
 pub(crate) fn resolve_run_environment(
@@ -80,6 +80,8 @@ fn resolve_environment_fields(
         lifecycle: resolve_lifecycle(layer.lifecycle.as_ref()),
         labels: layer.labels.clone().into_inner(),
         env: layer.env.clone().into_inner(),
+        // ACA: no cross-field validation yet; resolved verbatim.
+        aca: resolve_aca(layer.aca.as_ref()),
     };
     environment
 }
@@ -190,6 +192,35 @@ fn resolve_lifecycle(layer: Option<&EnvironmentLifecycleLayer>) -> EnvironmentLi
         preserve:         layer.preserve.unwrap_or(false),
         stop_on_terminal: layer.stop_on_terminal.unwrap_or(true),
         auto_stop:        layer.auto_stop,
+    }
+}
+
+// ACA: resolves the sparse `[aca]` layer into its settings shape. No
+// cross-field validation lives here; the warn-don't-fail region check is
+// performed downstream in `fabro-sandbox::aca_config_from_environment`,
+// where the region is finally consumed.
+fn resolve_aca(layer: Option<&AcaEnvironmentLayer>) -> AcaEnvironmentSettings {
+    let Some(layer) = layer else {
+        return AcaEnvironmentSettings::default();
+    };
+    AcaEnvironmentSettings {
+        region:          layer.region.clone(),
+        resource_group:  layer.resource_group.clone(),
+        sandbox_group:   layer.sandbox_group.clone(),
+        disk:            layer.disk.clone(),
+        region_override: layer.region_override.unwrap_or(false),
+        egress:          resolve_aca_egress(layer.egress.as_ref()),
+        auto_suspend:    layer.auto_suspend,
+    }
+}
+
+fn resolve_aca_egress(layer: Option<&AcaEgressLayer>) -> AcaEgressSettings {
+    let Some(layer) = layer else {
+        return AcaEgressSettings::default();
+    };
+    AcaEgressSettings {
+        allow:              layer.allow.clone(),
+        traffic_inspection: layer.traffic_inspection.clone(),
     }
 }
 

@@ -25,6 +25,9 @@ pub struct EnvironmentLayer {
     pub labels:    StickyMap<String>,
     #[serde(default, skip_serializing_if = "StickyMap::is_empty")]
     pub env:       StickyMap<InterpString>,
+    // ACA: per-environment ACA-specific settings; absent for other providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aca:       Option<AcaEnvironmentLayer>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
@@ -58,6 +61,9 @@ impl RunEnvironmentLayer {
             lifecycle: self.lifecycle,
             labels:    self.labels,
             env:       self.env,
+            // ACA: run-level environment overrides don't cover ACA-specific
+            // settings; only the base environment can set them.
+            aca:       None,
         }
     }
 }
@@ -113,6 +119,53 @@ pub struct EnvironmentLifecycleLayer {
     pub stop_on_terminal: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_stop:        Option<Duration>,
+}
+
+// ACA: sparse layer for the `[aca]` table. `region`/`resource_group`/
+// `sandbox_group`/`disk` are ops-provisioned per-environment settings;
+// `region_override` and `egress` back the warn-don't-fail region check and
+// the domain-based egress allowlist respectively (see `AcaEgressLayer`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
+#[serde(deny_unknown_fields)]
+pub struct AcaEnvironmentLayer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region:          Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_group:  Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_group:   Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk:            Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region_override: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress:          Option<AcaEgressLayer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_suspend:    Option<Duration>,
+}
+
+// ACA: domain-based egress allowlist (e.g. `*.github.com`), distinct from
+// the generic CIDR-based `EnvironmentNetworkLayer`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcaEgressLayer {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow:               Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_inspection:  Option<String>,
+}
+
+impl Combine for AcaEgressLayer {
+    fn combine(self, other: Self) -> Self {
+        Self {
+            allow: if self.allow.is_empty() {
+                other.allow
+            } else {
+                self.allow
+            },
+            traffic_inspection: self.traffic_inspection.or(other.traffic_inspection),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

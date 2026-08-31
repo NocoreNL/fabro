@@ -82,11 +82,9 @@ preserve = false
 stop_on_terminal = true
 "#;
 
-// ACA: copy of the Daytona default TOML for now; refined in Task 12.
+// ACA: no `[image]` table — ACA sandboxes select a base OS via `[aca].disk`
+// (see below), not a Docker image/Dockerfile.
 const ACA_DEFAULT_ENVIRONMENT_TOML: &str = r#"provider = "aca"
-
-[image]
-dockerfile = "FROM buildpack-deps:noble\n"
 
 [resources]
 cpu = 2
@@ -95,6 +93,22 @@ memory = "4GB"
 [lifecycle]
 preserve = false
 stop_on_terminal = true
+
+[aca]
+region = "northeurope"
+# ACA: resource_group/sandbox_group are ops-provisioned out of band (e.g.
+# `az group create` + `aca sandboxgroup create`), never created by Fabro
+# itself. Auth is via azure_identity's DefaultAzureCredential, so no
+# secrets are stored here; the identity Fabro runs as needs the
+# "Container Apps SandboxGroup Data Owner" RBAC role on the sandbox group.
+resource_group = "REPLACE_WITH_OPS_PROVISIONED_RESOURCE_GROUP"
+sandbox_group = "REPLACE_WITH_OPS_PROVISIONED_SANDBOX_GROUP"
+disk = "ubuntu"
+auto_suspend = "30m"
+
+[aca.egress]
+allow = ["*.github.com", "api.anthropic.com"]
+traffic_inspection = "Full"
 "#;
 
 #[derive(Debug)]
@@ -345,6 +359,10 @@ fn environment_from_row(row: &SqliteRow) -> Result<Environment, EnvironmentStore
             &labels_json,
         )?),
         env:       StickyMap::from(decode_env_json(&env_json)?),
+        // ACA: `EnvironmentSqlRow` has no columns for `[aca]` settings yet
+        // (follow-up: a schema migration to persist them), so a row loaded
+        // from SQLite always resolves to the default (inert) `aca` value.
+        aca:       None,
     };
 
     Environment::from_row(id, revision, &layer)
@@ -848,4 +866,37 @@ fn decode_env_json(value: &str) -> Result<HashMap<String, InterpString>, Environ
 
 fn row_count(count: usize) -> Result<i64, EnvironmentStoreError> {
     i64::try_from(count).map_err(|_| EnvironmentStoreError::RowCountOverflow { count })
+}
+
+// ACA:
+#[cfg(test)]
+mod aca_default_environment_tests {
+    use fabro_config::EnvironmentLayer;
+    use fabro_types::settings::run::EnvironmentProvider;
+
+    use super::ACA_DEFAULT_ENVIRONMENT_TOML;
+
+    #[test]
+    fn aca_default_environment_toml_parses_with_real_values() {
+        let layer: EnvironmentLayer = toml::from_str(ACA_DEFAULT_ENVIRONMENT_TOML)
+            .expect("aca default environment toml should parse");
+        let settings = fabro_config::resolve_environment_layer(&layer, "environment")
+            .expect("aca default environment toml should resolve");
+
+        assert_eq!(settings.provider, EnvironmentProvider::Aca);
+        assert_eq!(settings.aca.disk.as_deref(), Some("ubuntu"));
+        assert_eq!(
+            settings.aca.egress.traffic_inspection.as_deref(),
+            Some("Full")
+        );
+        assert_eq!(
+            settings.aca.egress.allow,
+            vec!["*.github.com".to_string(), "api.anthropic.com".to_string()]
+        );
+        // `northeurope` is a known ACA data-plane region (see
+        // fabro-sandbox's `aca::ACA_DATA_PLANE_REGIONS`, which
+        // fabro-environment doesn't depend on and so can't check directly).
+        assert_eq!(settings.aca.region.as_deref(), Some("northeurope"));
+        assert!(!settings.aca.region_override);
+    }
 }

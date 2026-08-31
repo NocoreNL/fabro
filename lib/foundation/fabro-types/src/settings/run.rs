@@ -1234,6 +1234,46 @@ pub struct EnvironmentLifecycleSettings {
     pub auto_stop:        Option<Duration>,
 }
 
+// ACA: Azure Container Apps sandbox-specific environment settings, layered
+// alongside the provider-agnostic fields above (image/resources/network/
+// lifecycle). Inert for non-ACA environments. `region`/`resource_group`/
+// `sandbox_group` are ops-provisioned (see the `aca` default environment
+// TOML for the RBAC note); `region_override` suppresses the warn-don't-fail
+// data-plane region check that `fabro-sandbox::aca_config_from_environment`
+// performs when mapping these into the runtime `AcaConfig`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AcaEnvironmentSettings {
+    pub region:          Option<String>,
+    pub resource_group:  Option<String>,
+    pub sandbox_group:   Option<String>,
+    pub disk:            Option<String>,
+    #[serde(default)]
+    pub region_override: bool,
+    #[serde(default)]
+    pub egress:          AcaEgressSettings,
+    pub auto_suspend:    Option<Duration>,
+}
+
+impl AcaEnvironmentSettings {
+    // ACA: used as a `skip_serializing_if` predicate so non-ACA environments
+    // don't grow an `"aca": {...}` key in serialized output (notably the
+    // public `/environments` API response, which an OpenAPI contract test
+    // pins to today's shape).
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+// ACA: domain-based egress allowlist for the sandbox's container app
+// environment (distinct from the generic CIDR-based `network.allow`, which
+// ACA does not use).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AcaEgressSettings {
+    #[serde(default)]
+    pub allow:               Vec<String>,
+    pub traffic_inspection:  Option<String>,
+}
+
 fn default_stop_on_terminal() -> bool {
     true
 }
@@ -1259,6 +1299,10 @@ pub struct EnvironmentSettings {
     pub lifecycle: EnvironmentLifecycleSettings,
     pub labels:    HashMap<String, String>,
     pub env:       HashMap<String, InterpString>,
+    // ACA: inert (and omitted from serialized output, to avoid widening the
+    // public API/OpenAPI response shape) for non-ACA providers.
+    #[serde(default, skip_serializing_if = "AcaEnvironmentSettings::is_default")]
+    pub aca:       AcaEnvironmentSettings,
 }
 
 impl Default for EnvironmentSettings {
@@ -1272,6 +1316,7 @@ impl Default for EnvironmentSettings {
             lifecycle: EnvironmentLifecycleSettings::default(),
             labels:    HashMap::new(),
             env:       HashMap::new(),
+            aca:       AcaEnvironmentSettings::default(),
         }
     }
 }
@@ -1288,6 +1333,9 @@ pub struct RunEnvironmentSettings {
     pub lifecycle: EnvironmentLifecycleSettings,
     pub labels:    HashMap<String, String>,
     pub env:       HashMap<String, InterpString>,
+    // ACA: inert (and omitted from serialized output) for non-ACA providers.
+    #[serde(default, skip_serializing_if = "AcaEnvironmentSettings::is_default")]
+    pub aca:       AcaEnvironmentSettings,
 }
 
 impl RunEnvironmentSettings {
@@ -1303,6 +1351,7 @@ impl RunEnvironmentSettings {
             lifecycle: environment.lifecycle,
             labels: environment.labels,
             env: environment.env,
+            aca: environment.aca,
         }
     }
 

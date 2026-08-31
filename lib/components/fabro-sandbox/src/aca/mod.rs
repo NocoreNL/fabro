@@ -32,3 +32,61 @@ pub struct AcaEgressPolicy {
     pub rules:              Vec<String>,
     pub traffic_inspection: String,
 }
+
+// ACA: Container Apps data-plane region list, from the `aca` CLI's
+// supported-region warning observed during the SP4 spike (see
+// `.superpowers/sdd/2026-08-28-sp4-aca-provider/` spike notes) — NOT the
+// full ARM `az account list-locations` list, which includes regions with no
+// ACA Sandboxes data-plane support. Azure adds regions over time, so this
+// list needs periodic refresh; a miss here only produces a warning (see
+// [`validate_aca_region`]), it never blocks sandbox creation.
+pub const ACA_DATA_PLANE_REGIONS: &[&str] = &[
+    "australiaeast",
+    "brazilsouth",
+    "canadacentral",
+    "centralus",
+    "eastasia",
+    "eastus2",
+    "francecentral",
+    "japaneast",
+    "koreacentral",
+    "mexicocentral",
+    "northcentralus",
+    "northeurope",
+    "norwayeast",
+    "polandcentral",
+    "southafricanorth",
+    "southeastasia",
+    "southindia",
+    "spaincentral",
+    "swedencentral",
+    "switzerlandnorth",
+    "uksouth",
+    "westcentralus",
+    "westus",
+    "westus2",
+    "westus3",
+];
+
+/// True when `region` (case-insensitive) appears in
+/// [`ACA_DATA_PLANE_REGIONS`].
+#[must_use]
+pub fn is_known_aca_region(region: &str) -> bool {
+    ACA_DATA_PLANE_REGIONS
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(region))
+}
+
+/// Warn-don't-fail region check: logs a warning when `region` is outside
+/// [`ACA_DATA_PLANE_REGIONS`] and `region_override` is not set. Never
+/// blocks — callers always proceed with `region` as configured.
+pub fn validate_aca_region(region: &str, region_override: bool) {
+    if region_override || is_known_aca_region(region) {
+        return;
+    }
+    tracing::warn!(
+        region,
+        "configured ACA region is not in the known data-plane region list; proceeding anyway \
+         (set region_override to silence this warning)"
+    );
+}
