@@ -11,7 +11,7 @@ mod sandbox;
 pub use sandbox::AcaSandbox;
 
 // ACA: creation params for an ACA sandbox. Mirrors `DaytonaConfig`'s role;
-// real sandbox construction against these lands in Task 8.
+// `AcaSandbox::new` builds the live handle from these (see `sandbox.rs`).
 #[derive(Clone, Debug)]
 pub struct AcaConfig {
     pub region:          String,

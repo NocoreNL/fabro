@@ -6,8 +6,10 @@
 //! operations (delegating to [`AcaClient`]'s `fs_*` endpoints) and `grep`
 //! (via exec, since ACA has no native search endpoint). Task 10 adds the
 //! lifecycle methods (`activate`/`start`/`stop`/`cleanup`) and the
-//! `with_running_retry` 409-\>resume-\>retry-once guard (spec rule 3);
-//! git/setup remain stubbed and land in Task 11.
+//! `with_running_retry` 409-\>resume-\>retry-once guard (spec rule 3). Task 11
+//! completes the block with `setup_git`/`git_push_ref`, delegating to the
+//! crate's shared exec-based git helpers (this provider has no managed push
+//! credentials yet, so pushes run with whatever the remote already carries).
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -25,12 +27,12 @@ use tokio_util::sync::CancellationToken;
 use crate::aca::client::SandboxState;
 use crate::aca::{AcaApiError, AcaClient, AcaConfig};
 use crate::sandbox::{
-    BASH_ENV_VAR, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, replay_exec_result, resolve_path,
-    validate_bash_probe,
+    BASH_ENV_VAR, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, git_push_via_exec, resolve_path,
+    setup_git_via_exec, validate_bash_probe,
 };
 use crate::{
-    DirEntry, ExecResult, ExecStreamingRequest, ExecStreamingResult, GrepOptions, Sandbox,
-    shell_quote,
+    DirEntry, ExecResult, ExecStreamingRequest, GitRunInfo, GitSetupIntent, GrepOptions,
+    PushError, PushReport, RetryPlan, Sandbox, shell_quote,
 };
 
 /// Remediation shown when an ACA sandbox has no usable Bash.
@@ -216,38 +218,12 @@ impl Sandbox for AcaSandbox {
         }
     }
 
-    /// ACA's exec endpoint is synchronous/buffered only — the capture doc
-    /// notes "No streaming — this is a synchronous, buffered exec" — so this
-    /// replays the completed [`Sandbox::exec_command`] result through the
-    /// output callback rather than streaming live chunks. Live per-chunk
-    /// streaming is deferred.
-    async fn exec_command_streaming(
-        &self,
-        request: ExecStreamingRequest<'_>,
-    ) -> crate::Result<ExecStreamingResult> {
-        if request.stdin.is_some() {
-            return Err(crate::Error::message(
-                "This sandbox does not support standard input for streaming commands",
-            ));
-        }
-        let timeout_ms = request.timeout_ms.unwrap_or(u64::MAX);
-        let result = self
-            .exec_command(
-                request.command,
-                timeout_ms,
-                request.working_dir,
-                request.env_vars,
-                request.cancel_token,
-            )
-            .await?;
-        replay_exec_result(
-            result,
-            true,
-            request.output_callback.as_ref(),
-            request.stream_output_bytes_cap,
-        )
-        .await
-    }
+    // ACA's exec endpoint is synchronous/buffered only — the capture doc
+    // notes "No streaming — this is a synchronous, buffered exec" — so
+    // `exec_command_streaming` has no ACA-specific behavior beyond what the
+    // trait default already does (replay the completed `exec_command` result
+    // through the output callback rather than streaming live chunks); the
+    // default is used as-is rather than restating it here.
 
     async fn initialize(&self) -> crate::Result<()> {
         self.run_bash_probe().await
@@ -478,6 +454,28 @@ impl Sandbox for AcaSandbox {
     /// covers both `cleanup()` and `delete()`.
     async fn cleanup(&self) -> crate::Result<()> {
         self.client.delete_sandbox(&self.sandbox_id).await
+    }
+
+    /// ACA is clone-based ([`fabro_types::SandboxProviderKind::is_clone_based`]
+    /// includes `Aca`), so — unlike the trait default's "no git" `Ok(None)`
+    /// — this always sets up a run branch, via the same exec transport
+    /// [`Sandbox::exec_command`] uses. Mirrors `daytona/mod.rs`'s
+    /// `setup_git`, minus its `repo_cloned()` guard: every `AcaSandbox` is
+    /// created from an already-cloned disk image.
+    async fn setup_git(&self, intent: &GitSetupIntent) -> crate::Result<Option<GitRunInfo>> {
+        setup_git_via_exec(self, intent).await.map(Some)
+    }
+
+    /// Pushes via the shared exec-based helper. `credentials` is `None`:
+    /// this provider has no managed push-credential state yet (no
+    /// `origin_url`/`PushCredentialState` tracking, unlike `daytona/mod.rs`),
+    /// so the push runs with whatever the remote already carries.
+    async fn git_push_ref(
+        &self,
+        refspec: &str,
+        plan: &RetryPlan,
+    ) -> Result<PushReport, PushError> {
+        git_push_via_exec(self, None, refspec, plan).await
     }
 }
 
@@ -1334,5 +1332,82 @@ mod tests {
         assert_eq!(sandbox.platform(), "linux");
         assert_eq!(sandbox.os_version(), "Linux (ACA ubuntu)");
         assert_eq!(sandbox.sandbox_info(), SANDBOX_ID);
+    }
+
+    /// `setup_git_via_exec` issues three git commands in sequence — read the
+    /// current branch, resolve the base SHA for a `NewRun` intent, then
+    /// `checkout -B` the new run branch — all through the same `exec`
+    /// transport as every other `AcaSandbox` command. This asserts ACA is
+    /// treated as clone-based (unlike the trait default's `Ok(None)`).
+    #[tokio::test]
+    async fn setup_git_creates_a_run_branch_via_exec_and_returns_git_run_info() {
+        let server = MockServer::start_async().await;
+        let _branch_mock = mock_exec_expecting(
+            &server,
+            "env -u BASH_ENV /bin/bash -c 'git rev-parse --abbrev-ref HEAD'",
+            "main\n",
+            "",
+            0,
+        )
+        .await;
+        let _sha_mock = mock_exec_expecting(
+            &server,
+            "env -u BASH_ENV /bin/bash -c 'git rev-parse HEAD'",
+            "abc123\n",
+            "",
+            0,
+        )
+        .await;
+        let checkout_mock = mock_exec_expecting(
+            &server,
+            "env -u BASH_ENV /bin/bash -c 'git checkout -B fabro/run/run-1 abc123'",
+            "",
+            "",
+            0,
+        )
+        .await;
+        let sandbox = test_sandbox(&server);
+
+        let info = sandbox
+            .setup_git(&GitSetupIntent::NewRun {
+                run_id: "run-1".to_string(),
+            })
+            .await
+            .expect("setup_git should succeed")
+            .expect("a clone-based provider should always set up a run branch");
+
+        assert_eq!(info.base_sha, "abc123");
+        assert_eq!(info.run_branch, "fabro/run/run-1");
+        assert_eq!(info.base_branch, Some("main".to_string()));
+        checkout_mock.assert_async().await;
+    }
+
+    /// `git_push_via_exec` with `credentials: None` issues exactly one `git
+    /// push` exec and reports success with no token/credential action —
+    /// this provider has no managed push-credential state yet.
+    #[tokio::test]
+    async fn git_push_ref_pushes_via_exec_without_managed_credentials() {
+        let server = MockServer::start_async().await;
+        let push_mock = mock_exec_expecting(
+            &server,
+            "env -u BASH_ENV /bin/bash -c 'git -c maintenance.auto=0 -c gc.auto=0 push origin \
+             refs/heads/fabro/run/run-1'",
+            "",
+            "",
+            0,
+        )
+        .await;
+        let sandbox = test_sandbox(&server);
+
+        let report = sandbox
+            .git_push_ref("refs/heads/fabro/run/run-1", &RetryPlan::checkpoint_push())
+            .await
+            .expect("git_push_ref should succeed");
+
+        assert_eq!(report.attempts.len(), 1);
+        assert!(report.attempts[0].success);
+        assert_eq!(report.attempts[0].token, None);
+        assert_eq!(report.attempts[0].credential_action, None);
+        push_mock.assert_async().await;
     }
 }
