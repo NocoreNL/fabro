@@ -4,11 +4,14 @@
 //! (wrapped as non-login `/bin/bash -c`), buffered-then-replay streaming, and
 //! the shared `BASH_PROBE_SCRIPT` readiness gate. Task 9 adds file
 //! operations (delegating to [`AcaClient`]'s `fs_*` endpoints) and `grep`
-//! (via exec, since ACA has no native search endpoint). `cleanup`/git/setup
-//! remain stubbed here and land in Tasks 10-11.
+//! (via exec, since ACA has no native search endpoint). Task 10 adds the
+//! lifecycle methods (`activate`/`start`/`stop`/`cleanup`) and the
+//! `with_running_retry` 409-\>resume-\>retry-once guard (spec rule 3);
+//! git/setup remain stubbed and land in Task 11.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,7 +22,8 @@ use tokio::sync::OnceCell;
 use tokio::{fs, time};
 use tokio_util::sync::CancellationToken;
 
-use crate::aca::{AcaClient, AcaConfig};
+use crate::aca::client::SandboxState;
+use crate::aca::{AcaApiError, AcaClient, AcaConfig};
 use crate::sandbox::{
     BASH_ENV_VAR, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, replay_exec_result, resolve_path,
     validate_bash_probe,
@@ -32,10 +36,6 @@ use crate::{
 /// Remediation shown when an ACA sandbox has no usable Bash.
 const ACA_BASH_REMEDIATION: &str = "ACA sandboxes require /bin/bash for every command, with no \
      `sh` fallback; use a disk image that provides bash, such as `ubuntu`.";
-
-/// Message returned by every trait method this task leaves unimplemented.
-/// Tasks 10-11 replace these stubs with real cleanup/git/setup behavior.
-const NOT_YET_IMPLEMENTED: &str = "aca: not yet implemented (task 10/11)";
 
 /// `Sandbox` implementation over the ACA data-plane REST client
 /// ([`AcaClient`]).
@@ -122,6 +122,50 @@ impl AcaSandbox {
             .map_err(|err| crate::Error::context(ACA_BASH_REMEDIATION, err))?;
         validate_bash_probe(result, ACA_BASH_REMEDIATION)
     }
+
+    /// Spec rule 3's per-op 409 guard: run `op` once; if it fails with ACA's
+    /// `GlobalSandboxNotRunning` 409 (an [`AcaApiError::NotRunning`]
+    /// somewhere in the error's source chain), `resume` the sandbox and run
+    /// `op` **exactly one more time**, propagating a second failure as-is.
+    ///
+    /// This is a single-shot retry, not a loop, and it is deliberately the
+    /// only place that reacts to a mid-session suspend: [`Self::activate`]
+    /// remains the one explicit resume at acquisition time, so callers must
+    /// not add a `get_sandbox` round-trip before every operation (that's the
+    /// anti-pattern spec rule 3 forbids).
+    async fn with_running_retry<T, F, Fut>(&self, op: F) -> crate::Result<T>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = crate::Result<T>>,
+    {
+        match op().await {
+            Ok(value) => Ok(value),
+            Err(error) if Self::is_not_running_error(&error) => {
+                self.client.resume(&self.sandbox_id).await?;
+                op().await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Walk `error`'s source chain for [`AcaApiError::NotRunning`], the same
+    /// downcast [`AcaClient`]'s own tests perform (`error.source()`, then
+    /// `downcast_ref::<AcaApiError>()`) generalized to tolerate any extra
+    /// layers of `crate::Error::Context` wrapping between the client and
+    /// this call site.
+    fn is_not_running_error(error: &crate::Error) -> bool {
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+        while let Some(err) = current {
+            if matches!(
+                err.downcast_ref::<AcaApiError>(),
+                Some(AcaApiError::NotRunning)
+            ) {
+                return true;
+            }
+            current = err.source();
+        }
+        false
+    }
 }
 
 #[async_trait]
@@ -139,7 +183,7 @@ impl Sandbox for AcaSandbox {
         let token = cancel_token.unwrap_or_default();
 
         tokio::select! {
-            result = self.client.exec(&self.sandbox_id, &wrapped) => {
+            result = self.with_running_retry(|| self.client.exec(&self.sandbox_id, &wrapped)) => {
                 let response = result?;
                 Ok(ExecResult {
                     stdout: response.stdout,
@@ -209,8 +253,27 @@ impl Sandbox for AcaSandbox {
         self.run_bash_probe().await
     }
 
+    /// Idempotent resume-if-`Stopped`: fetch current state and call `resume`
+    /// only when it's `Stopped`. An already-`Running` sandbox (or one whose
+    /// state can't be determined) is left alone — no unconditional resume.
+    /// This is the ONE explicit resume at acquisition time; the per-op 409
+    /// guard is [`Self::with_running_retry`], not a repeat of this check
+    /// before every call.
+    async fn activate(&self) -> crate::Result<()> {
+        let resource = self.client.get_sandbox(&self.sandbox_id).await?;
+        if matches!(resource.map(|r| r.state), Some(SandboxState::Stopped)) {
+            self.client.resume(&self.sandbox_id).await?;
+        }
+        Ok(())
+    }
+
     async fn start(&self) -> crate::Result<()> {
+        self.activate().await?;
         self.run_bash_probe().await
+    }
+
+    async fn stop(&self) -> crate::Result<()> {
+        self.client.suspend(&self.sandbox_id).await
     }
 
     fn working_directory(&self) -> &str {
@@ -411,10 +474,10 @@ impl Sandbox for AcaSandbox {
             .await
     }
 
-    // --- stub: real behavior lands in Task 10 ---
-
+    /// `Sandbox::delete`'s default forwards here, so this one override
+    /// covers both `cleanup()` and `delete()`.
     async fn cleanup(&self) -> crate::Result<()> {
-        Err(crate::Error::message(NOT_YET_IMPLEMENTED))
+        self.client.delete_sandbox(&self.sandbox_id).await
     }
 }
 
@@ -427,8 +490,9 @@ impl Sandbox for AcaSandbox {
 )]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use httpmock::Method::{GET, POST, PUT};
+    use httpmock::Method::{DELETE, GET, POST, PUT};
     use httpmock::MockServer;
 
     use super::*;
@@ -481,6 +545,89 @@ mod tests {
         format!(
             "/subscriptions/{SUBSCRIPTION}/resourceGroups/{RESOURCE_GROUP}/sandboxGroups/{SANDBOX_GROUP}/sandboxes/{SANDBOX_ID}/{action}"
         )
+    }
+
+    /// Plain `.../sandboxes/{id}` path (no trailing action) — used by
+    /// `get_sandbox`/`delete_sandbox`, mirroring `client.rs` tests'
+    /// `sandbox_path` helper.
+    fn sandbox_path() -> String {
+        format!(
+            "/subscriptions/{SUBSCRIPTION}/resourceGroups/{RESOURCE_GROUP}/sandboxGroups/{SANDBOX_GROUP}/sandboxes/{SANDBOX_ID}"
+        )
+    }
+
+    /// Minimal-but-complete `SandboxResource` body, mirroring `client.rs`
+    /// tests' `sandbox_body` helper (every field the type requires, with
+    /// only `state` varying per test).
+    fn sandbox_resource_body(state: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": SANDBOX_ID,
+            "createdAt": "2026-08-01T00:00:00Z",
+            "lifecycle": {
+                "autoSuspendPolicy": { "enabled": true, "interval": 600, "mode": "Memory" }
+            },
+            "managementUrl": "https://management.northeurope.azuredevcompute.io",
+            "region": "northeurope",
+            "resources": { "cpu": "1000m", "disk": "20480Mi", "memory": "2048Mi" },
+            "sourcesRef": { "diskImage": { "id": "img-1", "isPublic": false } },
+            "state": state,
+            "vmmType": "cloudhypervisor",
+        })
+    }
+
+    /// `problem+json` body for ACA's captured 409 `GlobalSandboxNotRunning`,
+    /// mirroring `client.rs` tests' `not_running_body` helper.
+    fn not_running_body() -> serde_json::Value {
+        serde_json::json!({
+            "title": "GlobalSandboxNotRunning",
+            "status": 409,
+            "detail": "Sandbox 'sbx-1' is not in Running state",
+            "errorCode": 501,
+            "traceId": "trace-1",
+            "requestId": "req-1",
+        })
+    }
+
+    async fn mock_get_sandbox<'a>(server: &'a MockServer, state: &'a str) -> httpmock::Mock<'a> {
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path(sandbox_path());
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(sandbox_resource_body(state));
+            })
+            .await
+    }
+
+    async fn mock_resume(server: &MockServer) -> httpmock::Mock<'_> {
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path(action_path("resume"));
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(sandbox_resource_body("Running"));
+            })
+            .await
+    }
+
+    async fn mock_suspend(server: &MockServer) -> httpmock::Mock<'_> {
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path(action_path("stop"));
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({ "id": "snap-1" }));
+            })
+            .await
+    }
+
+    async fn mock_delete_sandbox(server: &MockServer) -> httpmock::Mock<'_> {
+        server
+            .mock_async(|when, then| {
+                when.method(DELETE).path(sandbox_path());
+                then.status(204);
+            })
+            .await
     }
 
     fn file_stat_body(name: &str, path: &str, is_dir: bool, size: u64) -> serde_json::Value {
@@ -674,6 +821,9 @@ mod tests {
     #[tokio::test]
     async fn start_also_runs_the_bash_probe() {
         let server = MockServer::start_async().await;
+        // `start` now runs `activate` first; a `Running` state means no
+        // resume call is expected before the probe.
+        let _get_mock = mock_get_sandbox(&server, "Running").await;
         let _mock = mock_exec_expecting(
             &server,
             &format!("env -u BASH_ENV /bin/bash -c {}", shell_quote(BASH_PROBE_SCRIPT)),
@@ -688,11 +838,144 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_errors_instead_of_panicking() {
+    async fn activate_resumes_sandbox_when_state_is_stopped() {
         let server = MockServer::start_async().await;
+        let get_mock = mock_get_sandbox(&server, "Stopped").await;
+        let resume_mock = mock_resume(&server).await;
         let sandbox = test_sandbox(&server);
 
-        assert!(sandbox.cleanup().await.is_err());
+        sandbox
+            .activate()
+            .await
+            .expect("activate should succeed for a stopped sandbox");
+
+        get_mock.assert_calls_async(1).await;
+        resume_mock.assert_calls_async(1).await;
+    }
+
+    #[tokio::test]
+    async fn activate_does_not_resume_sandbox_when_state_is_running() {
+        let server = MockServer::start_async().await;
+        let get_mock = mock_get_sandbox(&server, "Running").await;
+        // Registered but expected to receive zero hits: activate() must not
+        // resume an already-running sandbox unconditionally.
+        let resume_mock = mock_resume(&server).await;
+        let sandbox = test_sandbox(&server);
+
+        sandbox
+            .activate()
+            .await
+            .expect("activate should succeed for a running sandbox");
+
+        get_mock.assert_calls_async(1).await;
+        resume_mock.assert_calls_async(0).await;
+    }
+
+    #[tokio::test]
+    async fn stop_calls_suspend() {
+        let server = MockServer::start_async().await;
+        let suspend_mock = mock_suspend(&server).await;
+        let sandbox = test_sandbox(&server);
+
+        sandbox.stop().await.expect("stop should succeed");
+
+        suspend_mock.assert_calls_async(1).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_calls_delete_sandbox() {
+        let server = MockServer::start_async().await;
+        let delete_mock = mock_delete_sandbox(&server).await;
+        let sandbox = test_sandbox(&server);
+
+        sandbox.cleanup().await.expect("cleanup should succeed");
+
+        delete_mock.assert_calls_async(1).await;
+    }
+
+    #[tokio::test]
+    async fn delete_forwards_to_delete_sandbox_via_the_default_cleanup_call() {
+        let server = MockServer::start_async().await;
+        let delete_mock = mock_delete_sandbox(&server).await;
+        let sandbox = test_sandbox(&server);
+
+        sandbox.delete().await.expect("delete should succeed");
+
+        delete_mock.assert_calls_async(1).await;
+    }
+
+    /// Spec rule 3: a single `GlobalSandboxNotRunning` 409 on the first exec
+    /// attempt triggers exactly one `resume`, then exactly one retried exec,
+    /// which succeeds. The 409 mock uses a shared counter in a custom
+    /// matcher so it only matches the FIRST request; the second request
+    /// falls through to the always-matching success mock — this is how
+    /// httpmock simulates "fails once, then succeeds" for two requests with
+    /// an otherwise-identical body.
+    #[tokio::test]
+    async fn exec_command_resumes_once_and_retries_after_a_409_then_succeeds() {
+        let server = MockServer::start_async().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let first_attempt = Arc::clone(&attempts);
+        let not_running_mock = server
+            .mock_async(move |when, then| {
+                when.method(POST)
+                    .path(exec_path())
+                    .json_body(
+                        serde_json::json!({ "command": "env -u BASH_ENV /bin/bash -c 'echo ok'" }),
+                    )
+                    .is_true(move |_req| first_attempt.fetch_add(1, Ordering::SeqCst) == 0);
+                then.status(409)
+                    .header("content-type", "application/problem+json")
+                    .json_body(not_running_body());
+            })
+            .await;
+        let resume_mock = mock_resume(&server).await;
+        let success_mock = mock_exec_expecting(
+            &server,
+            "env -u BASH_ENV /bin/bash -c 'echo ok'",
+            "ok\n",
+            "",
+            0,
+        )
+        .await;
+        let sandbox = test_sandbox(&server);
+
+        let result = sandbox
+            .exec_command("echo ok", 5_000, None, None, None)
+            .await
+            .expect("exec_command should succeed after resume+retry");
+
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.stdout, "ok\n");
+        not_running_mock.assert_calls_async(1).await;
+        resume_mock.assert_calls_async(1).await;
+        success_mock.assert_calls_async(1).await;
+    }
+
+    /// A persistent 409 must fail after exactly one retry — no loop: two
+    /// total exec attempts, one resume, then the second failure propagates.
+    #[tokio::test]
+    async fn exec_command_fails_after_one_retry_when_409_persists() {
+        let server = MockServer::start_async().await;
+        let not_running_mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path(exec_path());
+                then.status(409)
+                    .header("content-type", "application/problem+json")
+                    .json_body(not_running_body());
+            })
+            .await;
+        let resume_mock = mock_resume(&server).await;
+        let sandbox = test_sandbox(&server);
+
+        let error = sandbox
+            .exec_command("true", 5_000, None, None, None)
+            .await
+            .expect_err("a persistent 409 should fail after exactly one retry");
+
+        assert!(error.to_string().contains("ACA exec request failed"));
+        not_running_mock.assert_calls_async(2).await;
+        resume_mock.assert_calls_async(1).await;
     }
 
     #[tokio::test]
