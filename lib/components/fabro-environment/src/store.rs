@@ -84,11 +84,16 @@ stop_on_terminal = true
 
 // ACA: no `[image]` table — ACA sandboxes select a base OS via `[aca].disk`
 // (see below), not a Docker image/Dockerfile.
+// ACA: `memory` is a binary size ("4GiB"), not decimal ("4GB") like the
+// Docker/Daytona defaults above — the ACA data-plane create body wants
+// mebibytes (`from_environment.rs`'s `aca_memory_string`, per
+// `docs/aca-data-plane-api.md`'s create section), and "4GiB" is exactly
+// 4096 MiB, while decimal "4GB" would round to a non-clean "3815Mi".
 const ACA_DEFAULT_ENVIRONMENT_TOML: &str = r#"provider = "aca"
 
 [resources]
 cpu = 2
-memory = "4GB"
+memory = "4GiB"
 
 [lifecycle]
 preserve = false
@@ -884,6 +889,19 @@ mod aca_default_environment_tests {
             .expect("aca default environment toml should resolve");
 
         assert_eq!(settings.provider, EnvironmentProvider::Aca);
+        // ACA: confirms the default TOML's resources resolve to values that
+        // yield a contract-valid data-plane create body once mapped by
+        // `fabro-sandbox`'s `aca_config_from_environment`
+        // (`aca_cpu_string`/`aca_memory_string`): cpu=2 -> "2000m",
+        // memory="4GiB" (4294967296 bytes) -> "4096Mi" exactly. This crate
+        // has no dependency on fabro-sandbox, so it checks the resolved
+        // `resources` fields those functions consume rather than their
+        // output strings directly.
+        assert_eq!(settings.resources.cpu, Some(2));
+        assert_eq!(
+            settings.resources.memory.map(|size| size.as_bytes()),
+            Some(4 * 1024 * 1024 * 1024)
+        );
         assert_eq!(settings.aca.disk.as_deref(), Some("ubuntu"));
         assert_eq!(
             settings.aca.egress.traffic_inspection.as_deref(),

@@ -82,25 +82,36 @@ pub fn aca_config_from_environment(settings: &RunEnvironmentSettings) -> AcaConf
     }
 }
 
-// ACA: Azure Container Apps' `--cpu` flag wants a decimal vCPU count (e.g.
-// "2.0"); `resources.cpu` is a whole core count today.
+// ACA: the data-plane create body's `resources.cpu` wants a Kubernetes-style
+// millicpu string (e.g. "1000m"), per `docs/aca-data-plane-api.md`'s
+// **create** section and `provider/aca.rs`'s `parse_millicpu`/
+// `DEFAULT_ACA_CPU` — not the Azure CLI's `--cpu` flag units this used to
+// emit ("2.0"), which the data-plane client's `CreateResources` rejects
+// outright (its response parsers require the "m" suffix). `resources.cpu`
+// is a whole core count today, so this multiplies out to millicpu with no
+// fractional-core loss.
 #[cfg(feature = "aca")]
 fn aca_cpu_string(cpu: i32) -> String {
-    format!("{cpu}.0")
+    let millicpu = i64::from(cpu) * 1000;
+    format!("{millicpu}m")
 }
 
-// ACA: Azure Container Apps' `--memory` flag wants a binary-unit string
-// (e.g. "4Gi"), unlike Daytona's decimal-GB snapshot sizing below. ACA's
-// memory tiers are coarse (paired to the vCPU count) and `resources.memory`
-// is typically authored as a round decimal size (e.g. "4GB"), so this rounds
-// to the nearest whole GiB rather than preserving decimal/binary drift
-// (4_000_000_000 bytes ~= 3.73 GiB, which would otherwise render as
-// "3.73Gi" for what the operator wrote as "4GB").
+// ACA: mirrors `aca_cpu_string`'s unit fix — the create body's
+// `resources.memory` wants a Kubernetes-style mebibyte string (e.g.
+// "2048Mi"), per the same capture doc and `provider/aca.rs`'s
+// `parse_mebibytes`/`DEFAULT_ACA_MEMORY` — not the Azure CLI's `--memory`
+// flag units this used to emit ("4Gi"). `resources.memory` is typically
+// authored as a round decimal size (e.g. "4GB") or a binary size (e.g.
+// "4GiB"), so this rounds to the nearest whole MiB rather than requiring an
+// exact multiple (4_000_000_000 bytes ~= 3814.7 MiB, which rounds to
+// "3815Mi" for what the operator wrote as "4GB"; an operator who instead
+// writes "4GiB" gets an exact "4096Mi", matching the provider's own
+// "2048Mi" (=2 GiB) default convention).
 #[cfg(feature = "aca")]
 fn aca_memory_string(bytes: u64) -> String {
-    const GIB: f64 = (1024 * 1024 * 1024) as f64;
-    let gib = (bytes as f64 / GIB).round() as u64;
-    format!("{gib}Gi")
+    const MIB: f64 = (1024 * 1024) as f64;
+    let mib = (bytes as f64 / MIB).round() as u64;
+    format!("{mib}Mi")
 }
 
 #[cfg(feature = "daytona")]
@@ -377,8 +388,11 @@ mod tests {
         assert_eq!(config.resource_group, "rg-fabro-sandboxes");
         assert_eq!(config.sandbox_group, "sbg-fabro");
         assert_eq!(config.disk, "ubuntu");
-        assert_eq!(config.cpu.as_deref(), Some("2.0"));
-        assert_eq!(config.memory.as_deref(), Some("4Gi"));
+        // ACA: k8s units, not CLI-flag units — 2 cores -> "2000m"; 4GB
+        // (decimal, 4_000_000_000 bytes) -> 3814.697.. MiB, rounded to
+        // "3815Mi" (see `aca_memory_string`'s doc comment).
+        assert_eq!(config.cpu.as_deref(), Some("2000m"));
+        assert_eq!(config.memory.as_deref(), Some("3815Mi"));
         assert_eq!(
             config.egress.rules,
             vec!["*.github.com".to_string(), "api.anthropic.com".to_string()]
@@ -386,6 +400,49 @@ mod tests {
         assert_eq!(config.egress.traffic_inspection, "Full");
         assert_eq!(config.egress.default_action, "Deny");
         assert!(!config.region_override);
+    }
+
+    // ACA: boundary/round-trip test pinning the seam the per-task reviews
+    // missed — `provider/aca.rs`'s `CreateResources` (the data-plane create
+    // body) serializes `AcaConfig.cpu`/`.memory` verbatim, and its response
+    // parsers `parse_millicpu`/`parse_mebibytes` strictly require the "m"/
+    // "Mi" suffixes asserted below. Those parsers are private to
+    // `provider::aca` (not reachable from this module), so this mirrors
+    // their exact parsing logic rather than calling them directly, and also
+    // checks the mapping is exact (no rounding drift) at binary-unit inputs
+    // that match the provider's own defaults' convention
+    // (`DEFAULT_ACA_CPU` = "1000m", `DEFAULT_ACA_MEMORY` = "2048Mi" = 2 GiB).
+    #[cfg(feature = "aca")]
+    #[test]
+    fn aca_config_resources_are_k8s_units_that_round_trip_through_provider_parsers() {
+        let mut settings = run_environment(EnvironmentProvider::Aca);
+        settings.resources.cpu = Some(2);
+        settings.resources.memory = Some("4GiB".parse().expect("4GiB should parse as a Size"));
+
+        let config = aca_config_from_environment(&settings);
+
+        let cpu = config.cpu.expect("cpu should be set");
+        let memory = config.memory.expect("memory should be set");
+
+        // Exact values at a clean binary-unit input.
+        assert_eq!(cpu, "2000m");
+        assert_eq!(memory, "4096Mi");
+
+        // Round-trip: mirrors `provider/aca.rs`'s `parse_millicpu`.
+        let millicpu: f64 = cpu
+            .strip_suffix('m')
+            .expect("cpu string should have the 'm' suffix parse_millicpu requires")
+            .parse()
+            .expect("millicpu portion should be numeric");
+        assert_eq!(millicpu / 1000.0, 2.0);
+
+        // Round-trip: mirrors `provider/aca.rs`'s `parse_mebibytes`.
+        let mebibytes: u64 = memory
+            .strip_suffix("Mi")
+            .expect("memory string should have the 'Mi' suffix parse_mebibytes requires")
+            .parse()
+            .expect("mebibyte portion should be numeric");
+        assert_eq!(mebibytes * 1024 * 1024, 4 * 1024 * 1024 * 1024);
     }
 
     #[cfg(feature = "aca")]
