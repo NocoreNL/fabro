@@ -11,7 +11,7 @@ default = ["local"]
 local = []
 docker = ["dep:bollard", "dep:tar"]
 daytona = ["dep:daytona-sdk", "dep:daytona-api-client", "dep:git2", "dep:fabro-config", "dep:fabro-http", "dep:reqwest-middleware", "dep:rand", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls"]
-aca = ["dep:azure_identity", "dep:azure_core", "dep:fabro-http", "dep:url"]
+aca = ["dep:azure_identity", "dep:azure_core", "dep:fabro-http"]
 test-support = []
 
 [lib]
@@ -67,7 +67,6 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 # aca
 azure_identity = { version = "1.0.0", optional = true }
 azure_core = { version = "1.1.0", optional = true }
-url = { workspace = true, optional = true }
 
 [dev-dependencies]
 fabro-github = { path = "../fabro-github", features = ["test-support"] }
