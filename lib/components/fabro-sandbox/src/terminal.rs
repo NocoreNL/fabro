@@ -106,6 +106,10 @@ pub async fn open_terminal_for_run(
         SandboxProviderKind::Local => Err(crate::Error::message(
             "Local sandboxes do not support embedded terminals",
         )),
+        // ACA: no terminal implementation yet in either build (Task 8).
+        SandboxProviderKind::Aca => Err(crate::Error::message(
+            "Aca sandbox support is not yet implemented",
+        )),
     }
 }
 

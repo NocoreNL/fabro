@@ -1147,6 +1147,8 @@ pub enum EnvironmentProvider {
     Local,
     Docker,
     Daytona,
+    // ACA: Azure Container Apps sandbox environment.
+    Aca,
 }
 
 impl EnvironmentProvider {
@@ -1157,7 +1159,8 @@ impl EnvironmentProvider {
 
     #[must_use]
     pub fn is_clone_based(self) -> bool {
-        matches!(self, Self::Docker | Self::Daytona)
+        // ACA: clone-based like Daytona.
+        matches!(self, Self::Docker | Self::Daytona | Self::Aca)
     }
 }
 
@@ -1167,6 +1170,8 @@ impl From<EnvironmentProvider> for crate::SandboxProviderKind {
             EnvironmentProvider::Local => Self::Local,
             EnvironmentProvider::Docker => Self::Docker,
             EnvironmentProvider::Daytona => Self::Daytona,
+            // ACA: maps 1:1 to the sandbox provider kind.
+            EnvironmentProvider::Aca => Self::Aca,
         }
     }
 }

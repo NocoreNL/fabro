@@ -41,6 +41,11 @@ pub async fn sandbox_details(
             "Sandbox provider '{}' has no details implementation",
             record.provider
         )),
+        // ACA: no details implementation yet in either build (Task 8).
+        SandboxProviderKind::Aca => Err(anyhow::anyhow!(
+            "Sandbox provider '{}' has no details implementation",
+            record.provider
+        )),
     }
 }
 

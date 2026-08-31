@@ -238,5 +238,17 @@ fn validate_provider_capabilities(
                 });
             }
         }
+        // ACA: mirrors the Daytona arm's image validation until ACA-specific
+        // capability constraints land (Task 8).
+        EnvironmentProvider::Aca => {
+            if environment.image.docker.is_some() && environment.image.dockerfile.is_some() {
+                errors.push(ResolveError::Invalid {
+                    path:   format!("{path}.image"),
+                    reason: "aca environments accept either image.docker or image.dockerfile, not \
+                             both"
+                        .to_string(),
+                });
+            }
+        }
     }
 }

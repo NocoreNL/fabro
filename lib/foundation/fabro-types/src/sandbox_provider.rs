@@ -17,6 +17,8 @@ pub enum SandboxProviderKind {
     Docker,
     /// Run tools inside a Daytona cloud sandbox.
     Daytona,
+    // ACA: Run tools inside an Azure Container Apps sandbox.
+    Aca,
 }
 
 impl SandboxProviderKind {
@@ -31,7 +33,8 @@ impl SandboxProviderKind {
     /// True for providers that clone repository sources into their workspace.
     #[must_use]
     pub fn is_clone_based(&self) -> bool {
-        matches!(self, Self::Docker | Self::Daytona)
+        // ACA: clone-based like Daytona.
+        matches!(self, Self::Docker | Self::Daytona | Self::Aca)
     }
 
     /// Coerce non-local providers to `Local` under dry-run; otherwise

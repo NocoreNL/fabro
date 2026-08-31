@@ -456,6 +456,12 @@ async fn create_ssh_access(
             "Sandbox provider does not support access commands.",
         )
         .into_response(),
+        // ACA: no SSH access implementation yet (Task 8).
+        SandboxProviderKind::Aca => ApiError::new(
+            StatusCode::CONFLICT,
+            "Sandbox provider does not support access commands.",
+        )
+        .into_response(),
     }
 }
 

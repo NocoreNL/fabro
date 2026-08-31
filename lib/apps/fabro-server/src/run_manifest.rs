@@ -685,7 +685,10 @@ struct GitRemoteRefCheck {
 
 fn clone_disabled_for_provider(provider: SandboxProviderKind, resolved_run: &RunNamespace) -> bool {
     match provider {
-        SandboxProviderKind::Docker | SandboxProviderKind::Daytona => !resolved_run.clone.enabled,
+        // ACA: clone-based like Daytona.
+        SandboxProviderKind::Docker | SandboxProviderKind::Daytona | SandboxProviderKind::Aca => {
+            !resolved_run.clone.enabled
+        }
         SandboxProviderKind::Local => false,
     }
 }
@@ -745,6 +748,13 @@ fn environment_capability_warnings(resolved_run: &RunNamespace) -> Vec<String> {
         EnvironmentProvider::Daytona => {
             if environment.cwd.is_some() {
                 warnings.push("daytona provider ignores cwd".to_string());
+            }
+        }
+        // ACA: mirrors the Daytona arm until ACA-specific capability warnings
+        // land (Task 8).
+        EnvironmentProvider::Aca => {
+            if environment.cwd.is_some() {
+                warnings.push("aca provider ignores cwd".to_string());
             }
         }
     }
@@ -952,6 +962,13 @@ fn preflight_sandbox_spec(
                 clone_commit_sha: None,
                 api_key: daytona_api_key,
             }
+        }
+        // ACA: preflight `SandboxSpec` construction (no `SandboxSpec::Aca`
+        // variant yet) lands in Task 13; fail closed for now.
+        SandboxProviderKind::Aca => {
+            return Err(fabro_sandbox::Error::message(
+                "Aca sandbox provider is not yet supported for preflight checks",
+            ));
         }
     })
 }

@@ -525,6 +525,13 @@ impl RunSession {
                     api_key,
                 }
             }
+            // ACA: workflow execution wiring (a `SandboxSpec::Aca` variant and
+            // its construction) lands in Task 13; fail closed for now.
+            SandboxProviderKind::Aca => {
+                return Err(Error::engine(
+                    "Aca sandbox provider is not yet supported for workflow execution",
+                ));
+            }
         };
 
         let toml_env = resolved

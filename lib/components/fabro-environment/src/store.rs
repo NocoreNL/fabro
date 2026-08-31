@@ -82,6 +82,21 @@ preserve = false
 stop_on_terminal = true
 "#;
 
+// ACA: copy of the Daytona default TOML for now; refined in Task 12.
+const ACA_DEFAULT_ENVIRONMENT_TOML: &str = r#"provider = "aca"
+
+[image]
+dockerfile = "FROM buildpack-deps:noble\n"
+
+[resources]
+cpu = 2
+memory = "4GB"
+
+[lifecycle]
+preserve = false
+stop_on_terminal = true
+"#;
+
 #[derive(Debug)]
 pub struct EnvironmentStore {
     pool:      DbPool,
@@ -609,6 +624,8 @@ pub async fn seed_default_environment(
         EnvironmentProvider::Docker => DEFAULT_ENVIRONMENT_TOML,
         EnvironmentProvider::Daytona => DAYTONA_DEFAULT_ENVIRONMENT_TOML,
         EnvironmentProvider::Local => LOCAL_ENVIRONMENT_TOML,
+        // ACA:
+        EnvironmentProvider::Aca => ACA_DEFAULT_ENVIRONMENT_TOML,
     };
     let layer: EnvironmentLayer = toml::from_str(content).map_err(|source| {
         EnvironmentStoreError::parse(PathBuf::from("built-in-default-environment.toml"), source)

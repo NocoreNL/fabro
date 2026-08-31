@@ -64,6 +64,8 @@ impl SandboxSpec {
             SandboxProviderKind::Local => "local",
             SandboxProviderKind::Docker => "docker",
             SandboxProviderKind::Daytona => "daytona",
+            // ACA:
+            SandboxProviderKind::Aca => "aca",
         }
     }
 

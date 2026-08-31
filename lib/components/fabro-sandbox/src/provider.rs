@@ -1,3 +1,6 @@
+// ACA:
+#[cfg(feature = "aca")]
+pub mod aca;
 #[cfg(feature = "daytona")]
 pub mod daytona;
 #[cfg(feature = "docker")]
@@ -6,9 +9,10 @@ pub mod docker;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-#[cfg(any(feature = "docker", feature = "daytona"))]
+// ACA: also needed by the Aca variant.
+#[cfg(any(feature = "docker", feature = "daytona", feature = "aca"))]
 use fabro_github::GitHubCredentials;
-#[cfg(any(feature = "docker", feature = "daytona"))]
+#[cfg(any(feature = "docker", feature = "daytona", feature = "aca"))]
 use fabro_types::RunId;
 use fabro_types::{
     SandboxInfo, SandboxListMeta, SandboxListResponse, SandboxProviderKind,
@@ -17,6 +21,9 @@ use fabro_types::{
 use fabro_util::error::collect_chain;
 use futures::future::join_all;
 
+// ACA:
+#[cfg(feature = "aca")]
+use crate::aca::AcaConfig;
 #[cfg(feature = "daytona")]
 use crate::daytona::DaytonaConfig;
 #[cfg(feature = "docker")]
@@ -40,6 +47,16 @@ pub enum SandboxCreateSpec {
         clone_origin_url: Option<String>,
         clone_branch:     Option<String>,
         api_key:          Option<String>,
+    },
+    // ACA: mirrors Daytona but drops `api_key` (ACA authenticates via
+    // azure_identity, not a bearer token) and boxes `AcaConfig`.
+    #[cfg(feature = "aca")]
+    Aca {
+        config:           Box<AcaConfig>,
+        github_app:       Option<GitHubCredentials>,
+        run_id:           Option<RunId>,
+        clone_origin_url: Option<String>,
+        clone_branch:     Option<String>,
     },
 }
 

@@ -108,6 +108,9 @@ pub struct ServerSandboxProvidersLayer {
     pub docker:  Option<ServerSandboxProviderLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daytona: Option<ServerSandboxProviderLayer>,
+    // ACA:
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aca:     Option<ServerSandboxProviderLayer>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]

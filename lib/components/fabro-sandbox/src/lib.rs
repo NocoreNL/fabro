@@ -51,6 +51,9 @@ pub use git_retry::{
     CredentialContext, GitRetryReason, RetryPlan, classify_failure, retry_git_operation,
 };
 pub use local::LocalSandbox;
+// ACA:
+#[cfg(feature = "aca")]
+pub use provider::aca::AcaSandboxProvider;
 #[cfg(feature = "daytona")]
 pub use provider::daytona::DaytonaSandboxProvider;
 #[cfg(feature = "docker")]

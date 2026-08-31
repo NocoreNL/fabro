@@ -1111,7 +1111,10 @@ async fn validate_intent_environment(
     let image = &settings.run.environment.image;
     let image_incompatible = match provider {
         SandboxProviderKind::Docker => image.docker.is_none() && image.dockerfile.is_some(),
-        SandboxProviderKind::Local | SandboxProviderKind::Daytona => false,
+        // ACA:
+        SandboxProviderKind::Local | SandboxProviderKind::Daytona | SandboxProviderKind::Aca => {
+            false
+        }
     };
     let (target_incompatible, detail) = match target {
         RunTarget::Git(_) => (
