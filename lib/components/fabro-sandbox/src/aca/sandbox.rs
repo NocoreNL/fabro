@@ -1813,4 +1813,139 @@ mod tests {
         assert_eq!(report.attempts[0].credential_action, None);
         push_mock.assert_async().await;
     }
+
+    // ACA: live end-to-end smoke test (Task 15). Ignored + env-gated: only runs
+    // under `ACA_SMOKE=1` against real Azure with a pre-provisioned sandbox
+    // group and a throwaway `ACA_SMOKE_PAT` (contents:write on the scratch repo).
+    // Exercises the REAL provider + sandbox: create + egress -> BASH_PROBE +
+    // exit-code/stream fidelity -> authenticated git clone+push through the
+    // Deny/Full egress -> suspend/resume -> delete (teardown always runs).
+    #[tokio::test]
+    #[ignore = "live smoke: set ACA_SMOKE=1 + ACA_* env + ACA_SMOKE_PAT and run --ignored"]
+    async fn live_smoke_create_exec_clone_push_lifecycle_delete() {
+        if std::env::var("ACA_SMOKE").is_err() {
+            return;
+        }
+        let sub = std::env::var("ACA_SUBSCRIPTION_ID").expect("ACA_SUBSCRIPTION_ID");
+        let rg = std::env::var("ACA_RESOURCE_GROUP").expect("ACA_RESOURCE_GROUP");
+        let group = std::env::var("ACA_SANDBOX_GROUP").expect("ACA_SANDBOX_GROUP");
+        let region = std::env::var("ACA_REGION").expect("ACA_REGION");
+        let pat = std::env::var("ACA_SMOKE_PAT").expect("ACA_SMOKE_PAT");
+        let tag = std::env::var("ACA_SMOKE_TAG").unwrap_or_else(|_| "run".to_string());
+
+        let audience = "https://management.azuredevcompute.io";
+        let token: Arc<dyn crate::aca::auth::TokenSource> =
+            Arc::new(crate::aca::auth::EntraTokenSource::new(audience).expect("entra token source"));
+        let http = fabro_http::http_client().expect("http client");
+
+        let egress = AcaEgressPolicy {
+            default_action:     "Deny".to_string(),
+            rules:              vec![
+                "github.com:Allow".to_string(),
+                "*.github.com:Allow".to_string(),
+            ],
+            traffic_inspection: "Full".to_string(),
+        };
+        let config = AcaConfig {
+            region:          region.clone(),
+            resource_group:  rg.clone(),
+            sandbox_group:   group.clone(),
+            disk:            "ubuntu".to_string(),
+            cpu:             Some("1000m".to_string()),
+            memory:          Some("2048Mi".to_string()),
+            working_dir:     "/workspace".to_string(),
+            egress:          egress,
+            region_override: false,
+        };
+
+        let provider = crate::provider::aca::AcaSandboxProvider::new(
+            token.clone(),
+            http.clone(),
+            crate::provider::aca::AcaAccount {
+                subscription:   sub.clone(),
+                resource_group: rg.clone(),
+                sandbox_group:  group.clone(),
+                region:         region.clone(),
+            },
+        );
+
+        // Create (validates the k8s resource-unit body + egress apply live).
+        let info = <crate::provider::aca::AcaSandboxProvider as crate::SandboxProvider>::create(
+            &provider,
+            crate::SandboxCreateSpec::Aca {
+                config:           Box::new(config.clone()),
+                github_app:       None,
+                run_id:           None,
+                clone_origin_url: None,
+                clone_branch:     None,
+            },
+        )
+        .await
+        .expect("create ACA sandbox");
+        let sandbox_id = info.id.clone();
+        eprintln!("[smoke] created sandbox {sandbox_id} (state {:?})", info.state);
+
+        // Run the real flow; capture the result so teardown always runs.
+        let outcome = async {
+            let base = fabro_http::Url::parse(&format!(
+                "https://management.{region}.azuredevcompute.io"
+            ))
+            .expect("region base url");
+            let client = Arc::new(AcaClient::new(
+                http.clone(),
+                token.clone(),
+                base,
+                sub.clone(),
+                rg.clone(),
+                group.clone(),
+            ));
+            let sandbox =
+                AcaSandbox::new(client, sandbox_id.clone(), config.clone(), None, None, None)
+                    .expect("build AcaSandbox");
+
+            // Readiness: BASH_PROBE gate.
+            sandbox.initialize().await.expect("initialize (bash probe)");
+
+            // Exec fidelity: separated streams + exit code.
+            let r = sandbox
+                .exec_command("echo out; echo err 1>&2; exit 7", 60_000, None, None, None)
+                .await
+                .expect("exec");
+            assert!(r.stdout.contains("out"), "stdout: {}", r.stdout);
+            assert!(r.stderr.contains("err"), "stderr: {}", r.stderr);
+            assert_eq!(r.exit_code, Some(7), "exit code");
+
+            // Authenticated clone + commit + push through the Deny/Full egress.
+            // The PAT lives only in this runtime-built command string; it is
+            // never asserted on or logged.
+            let git = format!(
+                "set -e; rm -rf /tmp/r; \
+                 git clone https://x-access-token:{pat}@github.com/NocoreNL/aca-smoke-scratch /tmp/r; \
+                 cd /tmp/r; echo \"smoke {tag}\" > smoke-{tag}.txt; \
+                 git -c user.email=smoke@nocore.nl -c user.name=smoke add -A; \
+                 git -c user.email=smoke@nocore.nl -c user.name=smoke commit -m \"smoke {tag}\"; \
+                 git push origin HEAD:refs/heads/smoke-{tag}"
+            );
+            let g = sandbox
+                .exec_command(&git, 180_000, None, None, None)
+                .await
+                .expect("git flow");
+            assert!(g.is_success(), "git clone/push failed (exit {:?})", g.exit_code);
+
+            // Lifecycle: suspend then resume.
+            sandbox.stop().await.expect("stop/suspend");
+            sandbox.start().await.expect("start/resume");
+            Ok::<(), String>(())
+        }
+        .await;
+
+        // Teardown (always).
+        let _ = <crate::provider::aca::AcaSandboxProvider as crate::SandboxProvider>::delete(
+            &provider,
+            &sandbox_id,
+        )
+        .await;
+        eprintln!("[smoke] deleted sandbox {sandbox_id}");
+        outcome.expect("smoke flow");
+    }
 }
