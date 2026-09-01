@@ -56,12 +56,14 @@ pub enum SandboxSpec {
     },
     // ACA: mirrors `SandboxCreateSpec::Aca`'s field shape (no `api_key` — ACA
     // authenticates via `azure_identity`, not a bearer token) rather than
-    // `Daytona`'s: `AcaConfig` has no `skip_clone`, and no `AcaSandbox` field
-    // stores clone metadata (its disk image already has a repo baked in;
-    // there is no per-create clone step to pin a tag/commit against), so
-    // `clone_tag`/`clone_commit_sha` would have nothing to do here. Callers
-    // reject a pinned-revision request for this provider before constructing
-    // this variant (see `start.rs`'s `RunSession::new`).
+    // `Daytona`'s: `AcaConfig` has no `skip_clone`, and `AcaSandbox` clones a
+    // plain branch checkout into its single working directory during
+    // `initialize()` (see `aca/sandbox.rs`'s `clone_if_configured`) rather
+    // than Docker/Daytona's owner/repo layout with a per-create step to pin a
+    // tag/commit against, so `clone_tag`/`clone_commit_sha` would have
+    // nothing to do here. Callers reject a pinned-revision request for this
+    // provider before constructing this variant (see `start.rs`'s
+    // `RunSession::new`).
     #[cfg(feature = "aca")]
     Aca {
         config:           Box<AcaConfig>,
@@ -351,7 +353,21 @@ impl SandboxSpec {
                     .client_for(region, resource_group, sandbox_group)
                     .map_err(anyhow::Error::new)?;
 
-                let sandbox = AcaSandbox::new(Arc::new(client), info.id, config.as_ref().clone());
+                // ACA: thread the clone metadata this arm already
+                // destructured (`github_app`/`clone_origin_url`/
+                // `clone_branch`) into the live `AcaSandbox` handle, so
+                // `initialize()` can actually clone the repo instead of
+                // assuming a pre-baked disk image — this was the
+                // missing-clone gap (see `aca/sandbox.rs`).
+                let sandbox = AcaSandbox::new(
+                    Arc::new(client),
+                    info.id,
+                    config.as_ref().clone(),
+                    github_app.as_ref(),
+                    clone_origin_url.clone(),
+                    clone_branch.clone(),
+                )
+                .map_err(anyhow::Error::new)?;
                 Ok(Arc::new(sandbox))
             }
         }

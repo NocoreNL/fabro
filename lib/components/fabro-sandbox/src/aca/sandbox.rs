@@ -19,13 +19,25 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use fabro_types::CommandTermination;
+use fabro_types::{CommandTermination, SandboxProviderKind};
 use tokio::sync::OnceCell;
 use tokio::{fs, time};
 use tokio_util::sync::CancellationToken;
 
 use crate::aca::client::SandboxState;
 use crate::aca::{AcaApiError, AcaClient, AcaConfig};
+// ACA: clone-on-initialize reuses `git_retry`/`push_credentials`, the same
+// shared helpers Docker's `clone_github_repo` does — see
+// `clone_if_configured`/`clone_github_repo` below. `clone_source` (Docker's
+// owner/repo-layout + tag/commit-pinning helper module) is deliberately NOT
+// reused here: it is feature-gated to `docker`/`daytona` only, and ACA needs
+// just GitHub-origin validation/normalization, not the owner/repo layout or
+// pinned-revision machinery that make up most of that module — widening its
+// feature gate would compile that unused machinery (and its dead-code
+// warnings) into aca-only builds for a handful of lines' worth of reuse.
+use crate::git_retry::{self, CredentialContext};
+use crate::push_credentials::{self, PushCredentialState};
+use crate::redact::redact_auth_url;
 use crate::sandbox::{
     BASH_ENV_VAR, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, git_push_via_exec, resolve_path,
     setup_git_via_exec, validate_bash_probe,
@@ -39,6 +51,12 @@ use crate::{
 const ACA_BASH_REMEDIATION: &str = "ACA sandboxes require /bin/bash for every command, with no \
      `sh` fallback; use a disk image that provides bash, such as `ubuntu`.";
 
+/// Timeout for the single `git clone` exec issued by
+/// [`AcaSandbox::clone_github_repo`]. ACA has no per-request `clone_depth`
+/// knob (unlike `DockerSandboxOptions`), so this is a flat budget rather than
+/// Docker's shared multi-step deadline.
+const ACA_CLONE_TIMEOUT_MS: u64 = 5 * 60 * 1_000;
+
 /// `Sandbox` implementation over the ACA data-plane REST client
 /// ([`AcaClient`]).
 ///
@@ -50,6 +68,16 @@ pub struct AcaSandbox {
     client:     Arc<AcaClient>,
     sandbox_id: String,
     config:     AcaConfig,
+    // ACA: clone-on-initialize state, mirroring `DockerSandbox`'s
+    // `clone_origin_url`/`clone_branch`/`push_credentials` fields — see
+    // `clone_if_configured`/`clone_github_repo`.
+    clone_origin_url: Option<String>,
+    clone_branch:     Option<String>,
+    push_credentials: PushCredentialState,
+    /// Whether `initialize()` cloned a repository into `config.working_dir`.
+    /// Unset until `initialize()` runs. Mirrors `DockerSandbox`'s
+    /// `repo_cloned` field; gates [`Sandbox::setup_git`] the same way.
+    repo_cloned: OnceCell<bool>,
     /// Cached result of probing `rg --version` via exec, so [`Sandbox::grep`]
     /// only pays for the probe once per sandbox instance. Mirrors
     /// `daytona/mod.rs`'s `rg_available` field.
@@ -57,13 +85,34 @@ pub struct AcaSandbox {
 }
 
 impl AcaSandbox {
-    pub fn new(client: Arc<AcaClient>, sandbox_id: String, config: AcaConfig) -> Self {
-        Self {
+    /// `github_app`/`clone_origin_url`/`clone_branch` mirror
+    /// `DockerSandbox::new`'s parameters: `github_app` (plus the origin) build
+    /// the clone-time token source, and `clone_origin_url`/`clone_branch`
+    /// tell `initialize()` what to clone. Fallible for the same reason
+    /// Docker's constructor is: building the token source can fail (e.g. an
+    /// unparseable origin).
+    pub fn new(
+        client: Arc<AcaClient>,
+        sandbox_id: String,
+        config: AcaConfig,
+        github_app: Option<&fabro_github::GitHubCredentials>,
+        clone_origin_url: Option<String>,
+        clone_branch: Option<String>,
+    ) -> crate::Result<Self> {
+        let push_credentials = PushCredentialState::new(push_credentials::build_token_source(
+            github_app,
+            clone_origin_url.as_deref(),
+        )?);
+        Ok(Self {
             client,
             sandbox_id,
             config,
+            clone_origin_url,
+            clone_branch,
+            push_credentials,
+            repo_cloned: OnceCell::new(),
             rg_available: OnceCell::const_new(),
-        }
+        })
     }
 
     /// Resolve `path` against [`Sandbox::working_directory`]: relative paths
@@ -168,6 +217,182 @@ impl AcaSandbox {
         }
         false
     }
+
+    /// Whether `initialize()` cloned a repository into `config.working_dir`.
+    /// Mirrors `docker.rs`'s `repo_cloned()`.
+    fn repo_cloned(&self) -> bool {
+        self.repo_cloned.get().copied().unwrap_or(false)
+    }
+
+    /// Decide whether `initialize()` has anything to clone, and clone it if
+    /// so. ACA has no `skip_clone` knob (`AcaConfig` doesn't carry one — see
+    /// `SandboxSpec::Aca`'s doc comment) and no tag/commit pinning, so this
+    /// only needs the GitHub-origin validation/normalization slice of
+    /// Docker's `clone_source::decide_clone` — inlined here rather than
+    /// reused (see the `clone_source` import comment above).
+    async fn clone_if_configured(&self) -> crate::Result<()> {
+        let Some(origin_url) = self
+            .clone_origin_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+        else {
+            tracing::warn!(
+                provider = "aca",
+                "no clone source was present; creating an empty workspace without repository \
+                 files"
+            );
+            let _ = self.repo_cloned.set(false);
+            return Ok(());
+        };
+
+        let origin_url = fabro_github::normalize_repo_origin_url(origin_url);
+        if let Err(err) = fabro_github::parse_github_owner_repo(&origin_url) {
+            return Err(crate::Error::message(format!(
+                "Clone-based sandboxes currently support GitHub repository origins only: {err}"
+            )));
+        }
+        let branch = self
+            .clone_branch
+            .as_deref()
+            .filter(|branch| !branch.trim().is_empty())
+            .map(str::to_string);
+
+        self.clone_github_repo(origin_url, branch).await
+    }
+
+    /// Clone `origin_url` into `config.working_dir` via
+    /// [`Sandbox::exec_command`] (the `/bin/bash -c` transport, so it
+    /// inherits the bash contract and egress). Mirrors `docker.rs`'s
+    /// `clone_github_repo` (mint a clone-scoped token → embed it in the URL →
+    /// run the clone → record the embedded token), but without Docker's
+    /// owner/repo layout, symlink, or tag/commit pinning: an ACA sandbox has
+    /// one flat working directory and `SandboxSpec::Aca` carries no pinned-
+    /// revision fields (see its doc comment). `--branch` alone checks out the
+    /// branch, so no separate checkout step is needed for the (only)
+    /// unpinned-branch case.
+    async fn clone_github_repo(&self, origin_url: String, branch: Option<String>) -> crate::Result<()> {
+        // The clone mints its own token (never a warm-cache reuse) and seeds
+        // the shared source, so the first refresh compares against the clone
+        // token instead of believing nothing was ever embedded.
+        let resolved_token = match self.push_credentials.source() {
+            Some(source) => Some(source.mint_for_clone().await.map_err(|err| {
+                crate::Error::context_anyhow("Failed to get GitHub App credentials for clone", err)
+            })?),
+            None => None,
+        };
+        let clone_credential_context =
+            CredentialContext::from_snapshot(resolved_token.as_ref().map(|token| &token.snapshot));
+
+        let auth_url = match &resolved_token {
+            Some(token) => Some(
+                fabro_github::embed_token_in_url(&origin_url, token.token.expose()).map_err(
+                    |err| {
+                        crate::Error::context_anyhow(
+                            "Failed to build authenticated GitHub clone URL",
+                            err,
+                        )
+                    },
+                )?,
+            ),
+            None => None,
+        };
+        let clone_url = auth_url
+            .as_ref()
+            .map_or(origin_url.as_str(), |url| url.as_raw_url().as_str());
+
+        let command = aca_git_clone_command(clone_url, branch.as_deref(), &self.config.working_dir);
+
+        let plan = git_retry::RetryPlan::clone_default(None);
+        git_retry::retry_git_operation(
+            SandboxProviderKind::Aca,
+            "clone",
+            &plan,
+            |_attempt| async {
+                match self
+                    .exec_command(&command, ACA_CLONE_TIMEOUT_MS, None, None, None)
+                    .await
+                {
+                    Ok(result) if result.is_success() => Ok(()),
+                    Ok(result) => {
+                        let retry_reason = git_retry::classify_output(
+                            &result.stderr,
+                            &result.stdout,
+                            clone_credential_context,
+                        )
+                        .retry_reason();
+                        Err(AcaCloneFailure {
+                            error: self.clone_failure_error(
+                                result,
+                                "ACA git clone",
+                                auth_url.as_ref(),
+                            ),
+                            retry_reason,
+                        })
+                    }
+                    Err(error) => Err(AcaCloneFailure {
+                        error:        crate::Error::context("ACA git clone transport failed", error),
+                        retry_reason: None,
+                    }),
+                }
+            },
+            |failure: &AcaCloneFailure| failure.retry_reason,
+        )
+        .await
+        .map_err(|failure| failure.error)?;
+
+        if let Some(token) = resolved_token {
+            // The clone URL embedded this token in `origin`; record it so a
+            // future push refresh compares against the clone generation.
+            self.push_credentials.record_embedded(token).await;
+        }
+        let _ = self.repo_cloned.set(true);
+        Ok(())
+    }
+
+    /// Preserve a failed clone's exec result while masking the auth URL.
+    /// Mirrors `docker.rs`'s `clone_failure_error`.
+    fn clone_failure_error(
+        &self,
+        result: ExecResult,
+        label: &'static str,
+        auth_url: Option<&fabro_redact::DisplaySafeUrl>,
+    ) -> crate::Error {
+        let error =
+            result.into_exec_error_with_redactor(label, |output| redact_auth_url(output, auth_url));
+        let message = if self.push_credentials.source().is_none() {
+            "Git clone failed. If this is a private repository, configure a GitHub App with \
+             `fabro install` and install it for your organization."
+        } else {
+            "Failed to clone repository into ACA sandbox"
+        };
+        crate::Error::context(message, error)
+    }
+}
+
+/// What a failed clone attempt tells the retry loop. Mirrors `docker.rs`'s
+/// `DockerCloneFailure`.
+struct AcaCloneFailure {
+    error:        crate::Error,
+    retry_reason: Option<git_retry::GitRetryReason>,
+}
+
+/// Build the `git clone` command for the (only) case ACA supports: an
+/// unpinned branch clone straight into `checkout_path`. Mirrors `docker.rs`'s
+/// `git_clone_command`, minus the `--depth` argument: `AcaConfig` has no
+/// `clone_depth` knob to plumb through, so every ACA clone fetches full
+/// history.
+fn aca_git_clone_command(clone_url: &str, branch: Option<&str>, checkout_path: &str) -> String {
+    let mut command = format!("{} clone", crate::sandbox::GIT);
+    if let Some(branch) = branch {
+        command.push_str(" --branch ");
+        command.push_str(&shell_quote(branch));
+        command.push_str(" --single-branch");
+    }
+    command.push_str(" --no-tags -- ");
+    command.push_str(&shell_quote(clone_url));
+    command.push(' ');
+    command.push_str(&shell_quote(checkout_path));
+    command
 }
 
 #[async_trait]
@@ -225,8 +450,14 @@ impl Sandbox for AcaSandbox {
     // through the output callback rather than streaming live chunks); the
     // default is used as-is rather than restating it here.
 
+    // ACA: clone-based (`is_clone_based()` includes `Aca`), but ACA's create
+    // call ignores `clone_origin_url` (unlike Docker/Daytona), so nothing
+    // clones the repo unless this does it — the missing-clone gap this fix
+    // closes. Runs after the readiness probe so a clone never races an
+    // unready bash.
     async fn initialize(&self) -> crate::Result<()> {
-        self.run_bash_probe().await
+        self.run_bash_probe().await?;
+        self.clone_if_configured().await
     }
 
     /// Idempotent resume-if-`Stopped`: fetch current state and call `resume`
@@ -458,18 +689,22 @@ impl Sandbox for AcaSandbox {
 
     /// ACA is clone-based ([`fabro_types::SandboxProviderKind::is_clone_based`]
     /// includes `Aca`), so — unlike the trait default's "no git" `Ok(None)`
-    /// — this always sets up a run branch, via the same exec transport
-    /// [`Sandbox::exec_command`] uses. Mirrors `daytona/mod.rs`'s
-    /// `setup_git`, minus its `repo_cloned()` guard: every `AcaSandbox` is
-    /// created from an already-cloned disk image.
+    /// — this sets up a run branch via the same exec transport
+    /// [`Sandbox::exec_command`] uses, when `initialize()` actually cloned a
+    /// repository. Mirrors `docker.rs`'s `setup_git`, including its
+    /// `repo_cloned()` guard: an ACA sandbox with no `clone_origin_url`
+    /// configured has no repository to branch inside.
     async fn setup_git(&self, intent: &GitSetupIntent) -> crate::Result<Option<GitRunInfo>> {
+        if !self.repo_cloned() {
+            return Ok(None);
+        }
         setup_git_via_exec(self, intent).await.map(Some)
     }
 
     /// Pushes via the shared exec-based helper. `credentials` is `None`:
-    /// this provider has no managed push-credential state yet (no
-    /// `origin_url`/`PushCredentialState` tracking, unlike `daytona/mod.rs`),
-    /// so the push runs with whatever the remote already carries.
+    /// `push_credentials` (added for clone-time token minting — see
+    /// `clone_github_repo`) is not yet wired into push-time credential
+    /// refresh, so the push runs with whatever the remote already carries.
     async fn git_push_ref(
         &self,
         refspec: &str,
@@ -532,7 +767,35 @@ mod tests {
             Arc::new(test_client(server)),
             SANDBOX_ID.to_string(),
             test_config(),
+            None,
+            None,
+            None,
         )
+        .expect("test sandbox construction should succeed")
+    }
+
+    /// A fake PAT — never a real token — so `clone_github_repo` mints a
+    /// clone-scoped credential without any network mint call
+    /// (`GitHubCredentials::Pat` resolves statically; see
+    /// `push_credentials.rs`'s own tests for the same pattern).
+    const FAKE_CLONE_PAT: &str = "ghp_fake_test_token_do_not_use";
+
+    fn test_sandbox_with_clone(
+        server: &MockServer,
+        clone_origin_url: Option<&str>,
+        clone_branch: Option<&str>,
+    ) -> AcaSandbox {
+        AcaSandbox::new(
+            Arc::new(test_client(server)),
+            SANDBOX_ID.to_string(),
+            test_config(),
+            Some(&fabro_github::GitHubCredentials::Pat(
+                FAKE_CLONE_PAT.to_string(),
+            )),
+            clone_origin_url.map(str::to_string),
+            clone_branch.map(str::to_string),
+        )
+        .expect("test sandbox construction should succeed")
     }
 
     fn exec_path() -> String {
@@ -814,6 +1077,89 @@ mod tests {
             .initialize()
             .await
             .expect("probe with the marker should pass readiness");
+    }
+
+    /// `clone_origin_url = None` (the local/no-clone case) — `initialize()`
+    /// must not attempt any clone, only the readiness probe. Registers a
+    /// mock for what a clone `git` exec would look like and asserts it never
+    /// fires.
+    #[tokio::test]
+    async fn initialize_does_not_clone_when_no_origin_is_configured() {
+        let server = MockServer::start_async().await;
+        let _probe_mock = mock_exec_expecting(
+            &server,
+            &format!("env -u BASH_ENV /bin/bash -c {}", shell_quote(BASH_PROBE_SCRIPT)),
+            "fabro-bash-ready\n",
+            "",
+            0,
+        )
+        .await;
+        let clone_mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path(exec_path())
+                    .body_includes("git -c maintenance.auto=0 -c gc.auto=0 clone");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "executionTimeMs": 1,
+                        "exitCode": 0,
+                        "stderr": "",
+                        "stdout": "",
+                    }));
+            })
+            .await;
+        let sandbox = test_sandbox(&server);
+
+        sandbox
+            .initialize()
+            .await
+            .expect("initialize with no clone origin should still succeed");
+
+        clone_mock.assert_calls_async(0).await;
+    }
+
+    /// `initialize()` with a `clone_origin_url` configured clones the repo
+    /// via exec after the readiness probe: mints a token from the (fake,
+    /// test-only) GitHub credential, embeds it in the clone URL, and execs
+    /// `git clone` straight into `config.working_dir`. Asserts the exec
+    /// request body carries the clone command and the working dir, and that
+    /// SOME token is embedded — never a real one (`FAKE_CLONE_PAT` is a fake
+    /// test-only credential, never a real one).
+    #[tokio::test]
+    async fn initialize_clones_the_configured_repo_with_an_embedded_token() {
+        let server = MockServer::start_async().await;
+        let _probe_mock = mock_exec_expecting(
+            &server,
+            &format!("env -u BASH_ENV /bin/bash -c {}", shell_quote(BASH_PROBE_SCRIPT)),
+            "fabro-bash-ready\n",
+            "",
+            0,
+        )
+        .await;
+        let auth_url = fabro_github::embed_token_in_url("https://github.com/acme/widgets", FAKE_CLONE_PAT)
+            .expect("embed fake token in clone url");
+        let clone_command =
+            aca_git_clone_command(auth_url.as_raw_url().as_str(), Some("main"), "/workspace");
+        let clone_command_wrapped =
+            format!("env -u BASH_ENV /bin/bash -c {}", shell_quote(&clone_command));
+        let clone_mock = mock_exec_expecting(&server, &clone_command_wrapped, "", "", 0).await;
+        let sandbox = test_sandbox_with_clone(
+            &server,
+            Some("https://github.com/acme/widgets"),
+            Some("main"),
+        );
+
+        sandbox
+            .initialize()
+            .await
+            .expect("initialize should clone the configured repo");
+
+        // The mock only matches the exact command built with the fake
+        // token embedded — this proves both the clone command shape (git
+        // clone into /workspace) and that a token was embedded, without ever
+        // asserting on a real credential.
+        clone_mock.assert_async().await;
     }
 
     #[tokio::test]
@@ -1337,11 +1683,34 @@ mod tests {
     /// `setup_git_via_exec` issues three git commands in sequence — read the
     /// current branch, resolve the base SHA for a `NewRun` intent, then
     /// `checkout -B` the new run branch — all through the same `exec`
-    /// transport as every other `AcaSandbox` command. This asserts ACA is
-    /// treated as clone-based (unlike the trait default's `Ok(None)`).
+    /// transport as every other `AcaSandbox` command. `setup_git` only does
+    /// this once `initialize()` actually cloned a repository (the
+    /// `repo_cloned()` guard — see its doc comment), so this drives a real
+    /// clone through `initialize()` first, proving `setup_git` proceeds
+    /// against the repository the clone step just produced.
     #[tokio::test]
     async fn setup_git_creates_a_run_branch_via_exec_and_returns_git_run_info() {
         let server = MockServer::start_async().await;
+        let _probe_mock = mock_exec_expecting(
+            &server,
+            &format!("env -u BASH_ENV /bin/bash -c {}", shell_quote(BASH_PROBE_SCRIPT)),
+            "fabro-bash-ready\n",
+            "",
+            0,
+        )
+        .await;
+        let auth_url = fabro_github::embed_token_in_url("https://github.com/acme/widgets", FAKE_CLONE_PAT)
+            .expect("embed fake token in clone url");
+        let clone_command =
+            aca_git_clone_command(auth_url.as_raw_url().as_str(), Some("main"), "/workspace");
+        let _clone_mock = mock_exec_expecting(
+            &server,
+            &format!("env -u BASH_ENV /bin/bash -c {}", shell_quote(&clone_command)),
+            "",
+            "",
+            0,
+        )
+        .await;
         let _branch_mock = mock_exec_expecting(
             &server,
             "env -u BASH_ENV /bin/bash -c 'git rev-parse --abbrev-ref HEAD'",
@@ -1366,7 +1735,15 @@ mod tests {
             0,
         )
         .await;
-        let sandbox = test_sandbox(&server);
+        let sandbox = test_sandbox_with_clone(
+            &server,
+            Some("https://github.com/acme/widgets"),
+            Some("main"),
+        );
+        sandbox
+            .initialize()
+            .await
+            .expect("initialize should clone the configured repo");
 
         let info = sandbox
             .setup_git(&GitSetupIntent::NewRun {
@@ -1374,12 +1751,30 @@ mod tests {
             })
             .await
             .expect("setup_git should succeed")
-            .expect("a clone-based provider should always set up a run branch");
+            .expect("a cloned sandbox should always set up a run branch");
 
         assert_eq!(info.base_sha, "abc123");
         assert_eq!(info.run_branch, "fabro/run/run-1");
         assert_eq!(info.base_branch, Some("main".to_string()));
         checkout_mock.assert_async().await;
+    }
+
+    /// `setup_git` returns `Ok(None)` instead of running git commands when
+    /// `initialize()` found no clone source (`repo_cloned()` is false) — a
+    /// sandbox with nothing cloned has no repository to branch inside.
+    #[tokio::test]
+    async fn setup_git_returns_none_when_nothing_was_cloned() {
+        let server = MockServer::start_async().await;
+        let sandbox = test_sandbox(&server);
+
+        let info = sandbox
+            .setup_git(&GitSetupIntent::NewRun {
+                run_id: "run-1".to_string(),
+            })
+            .await
+            .expect("setup_git should succeed even with nothing cloned");
+
+        assert!(info.is_none());
     }
 
     /// `git_push_via_exec` with `credentials: None` issues exactly one `git
