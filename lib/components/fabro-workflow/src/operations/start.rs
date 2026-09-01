@@ -535,12 +535,12 @@ impl RunSession {
             // rejects a pinned tag/commit request outright rather than
             // threading `clone_source.tag`/`clone_source.commit_sha`
             // through: `SandboxSpec::Aca` (mirroring `SandboxCreateSpec::Aca`,
-            // T4) has no field for either, because an ACA sandbox always
-            // starts from its pre-baked disk image (no per-create clone step
-            // exists to pin against) — see that variant's doc comment in
-            // `sandbox_spec.rs`. Silently dropping the pin instead would run
-            // the caller's request against whatever the image happens to
-            // contain, with no indication that the pin was never honored.
+            // T4) has no field for either, because an ACA sandbox clones the
+            // repo at initialize() but does not support tag/commit pinning —
+            // see that variant's doc comment in `sandbox_spec.rs`. Silently
+            // dropping the pin instead would run the caller's request against
+            // whatever branch was just cloned, with no indication that the
+            // pin was never honored.
             SandboxProviderKind::Aca => {
                 #[cfg(feature = "aca")]
                 {

@@ -270,7 +270,11 @@ impl AcaSandbox {
     /// revision fields (see its doc comment). `--branch` alone checks out the
     /// branch, so no separate checkout step is needed for the (only)
     /// unpinned-branch case.
-    async fn clone_github_repo(&self, origin_url: String, branch: Option<String>) -> crate::Result<()> {
+    async fn clone_github_repo(
+        &self,
+        origin_url: String,
+        branch: Option<String>,
+    ) -> crate::Result<()> {
         // The clone mints its own token (never a warm-cache reuse) and seeds
         // the shared source, so the first refresh compares against the clone
         // token instead of believing nothing was ever embedded.
@@ -330,7 +334,7 @@ impl AcaSandbox {
                         })
                     }
                     Err(error) => Err(AcaCloneFailure {
-                        error:        crate::Error::context("ACA git clone transport failed", error),
+                        error: crate::Error::context("ACA git clone transport failed", error),
                         retry_reason: None,
                     }),
                 }
@@ -1137,8 +1141,9 @@ mod tests {
             0,
         )
         .await;
-        let auth_url = fabro_github::embed_token_in_url("https://github.com/acme/widgets", FAKE_CLONE_PAT)
-            .expect("embed fake token in clone url");
+        let auth_url =
+            fabro_github::embed_token_in_url("https://github.com/acme/widgets", FAKE_CLONE_PAT)
+                .expect("embed fake token in clone url");
         let clone_command =
             aca_git_clone_command(auth_url.as_raw_url().as_str(), Some("main"), "/workspace");
         let clone_command_wrapped =
@@ -1699,7 +1704,10 @@ mod tests {
             0,
         )
         .await;
-        let auth_url = fabro_github::embed_token_in_url("https://github.com/acme/widgets", FAKE_CLONE_PAT)
+        let auth_url = fabro_github::embed_token_in_url(
+            "https://github.com/acme/widgets",
+            FAKE_CLONE_PAT,
+        )
             .expect("embed fake token in clone url");
         let clone_command =
             aca_git_clone_command(auth_url.as_raw_url().as_str(), Some("main"), "/workspace");
