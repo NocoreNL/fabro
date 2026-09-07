@@ -1899,21 +1899,31 @@ mod tests {
                 rg.clone(),
                 group.clone(),
             ));
+            // Use Result throughout (never panic) so teardown always runs.
             let sandbox =
                 AcaSandbox::new(client, sandbox_id.clone(), config.clone(), None, None, None)
-                    .expect("build AcaSandbox");
+                    .map_err(|e| format!("build AcaSandbox: {e}"))?;
 
             // Readiness: BASH_PROBE gate.
-            sandbox.initialize().await.expect("initialize (bash probe)");
+            sandbox
+                .initialize()
+                .await
+                .map_err(|e| format!("initialize (bash probe): {e}"))?;
 
             // Exec fidelity: separated streams + exit code.
             let r = sandbox
                 .exec_command("echo out; echo err 1>&2; exit 7", 60_000, None, None, None)
                 .await
-                .expect("exec");
-            assert!(r.stdout.contains("out"), "stdout: {}", r.stdout);
-            assert!(r.stderr.contains("err"), "stderr: {}", r.stderr);
-            assert_eq!(r.exit_code, Some(7), "exit code");
+                .map_err(|e| format!("exec: {e}"))?;
+            if !r.stdout.contains("out") {
+                return Err(format!("stdout missing 'out': {}", r.stdout));
+            }
+            if !r.stderr.contains("err") {
+                return Err(format!("stderr missing 'err': {}", r.stderr));
+            }
+            if r.exit_code != Some(7) {
+                return Err(format!("exit code {:?} != 7", r.exit_code));
+            }
 
             // Authenticated clone + commit + push through the Deny/Full egress.
             // The PAT lives only in this runtime-built command string; it is
@@ -1929,12 +1939,20 @@ mod tests {
             let g = sandbox
                 .exec_command(&git, 180_000, None, None, None)
                 .await
-                .expect("git flow");
-            assert!(g.is_success(), "git clone/push failed (exit {:?})", g.exit_code);
+                .map_err(|e| format!("git flow exec: {e}"))?;
+            if !g.is_success() {
+                // stderr may reveal a 403 (PAT lacks write) or an egress block;
+                // it does not contain the token (the token is only in the URL,
+                // which git redacts in its error output).
+                return Err(format!(
+                    "git clone/push failed (exit {:?}); stderr: {}",
+                    g.exit_code, g.stderr
+                ));
+            }
 
             // Lifecycle: suspend then resume.
-            sandbox.stop().await.expect("stop/suspend");
-            sandbox.start().await.expect("start/resume");
+            sandbox.stop().await.map_err(|e| format!("stop/suspend: {e}"))?;
+            sandbox.start().await.map_err(|e| format!("start/resume: {e}"))?;
             Ok::<(), String>(())
         }
         .await;
