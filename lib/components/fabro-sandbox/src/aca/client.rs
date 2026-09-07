@@ -158,13 +158,20 @@ pub enum SandboxState {
 pub struct SandboxResource {
     pub id:         String,
     pub state:      SandboxState,
-    pub region:     String,
     pub created_at: String,
-    pub management_url: String,
     pub lifecycle:  Lifecycle,
     pub resources:  SandboxResources,
     pub sources_ref: SourcesRef,
-    pub vmm_type:   String,
+    // Runtime/placement fields: present when Running, but a Stopped sandbox's
+    // `get` response omits `region`/`managementUrl`/`vmmType` entirely (only
+    // `state`/`resources`/`stateDetails`/`snapshotId` remain). Optional so
+    // `activate()`'s state check can decode a Stopped sandbox.
+    #[serde(default)]
+    pub region:     Option<String>,
+    #[serde(default)]
+    pub management_url: Option<String>,
+    #[serde(default)]
+    pub vmm_type:   Option<String>,
     /// Absent from the initial `create` response (server assigns egress IPs
     /// after the fact); present on `get`/`list`.
     #[serde(default)]
@@ -806,7 +813,7 @@ mod tests {
 
         assert_eq!(resource.id, "sbx-1");
         assert_eq!(resource.state, SandboxState::Running);
-        assert_eq!(resource.region, "northeurope");
+        assert_eq!(resource.region.as_deref(), Some("northeurope"));
         mock.assert_async().await;
     }
 

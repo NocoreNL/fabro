@@ -325,8 +325,8 @@ fn sandbox_info_from_resource(
         native_state: Some(native_state.to_string()),
         image: Some(resource.sources_ref.disk_image.id.clone()),
         snapshot: resource.snapshot_id.clone(),
-        region: Some(resource.region.clone()),
-        web_url: Some(resource.management_url.clone()),
+        region: resource.region.clone(),
+        web_url: resource.management_url.clone(),
         working_directory,
         resources: SandboxResources {
             cpu_cores:    parse_millicpu(&resource.resources.cpu),
