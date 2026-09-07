@@ -2,14 +2,15 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use fabro_config::{
-    EnvironmentDockerfileLayer, EnvironmentImageLayer, EnvironmentLayer, EnvironmentLifecycleLayer,
-    EnvironmentNetworkLayer, EnvironmentResourcesLayer, StickyMap,
+    AcaEgressLayer, AcaEnvironmentLayer, EnvironmentDockerfileLayer, EnvironmentImageLayer,
+    EnvironmentLayer, EnvironmentLifecycleLayer, EnvironmentNetworkLayer,
+    EnvironmentResourcesLayer, StickyMap,
 };
 use fabro_types::settings::InterpString;
 use fabro_types::settings::run::{
-    DockerfileSource, EnvironmentImageSettings, EnvironmentLifecycleSettings,
-    EnvironmentNetworkMode, EnvironmentNetworkSettings, EnvironmentResourcesSettings,
-    EnvironmentSettings,
+    AcaEgressSettings, AcaEnvironmentSettings, DockerfileSource, EnvironmentImageSettings,
+    EnvironmentLifecycleSettings, EnvironmentNetworkMode, EnvironmentNetworkSettings,
+    EnvironmentResourcesSettings, EnvironmentSettings,
 };
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -120,6 +121,10 @@ pub(crate) fn canonical_bytes(layer: &EnvironmentLayer) -> String {
     if let Some(lifecycle) = layer.lifecycle.as_ref() {
         append_lifecycle(doc.as_table_mut(), lifecycle);
     }
+    // ACA:
+    if let Some(aca) = layer.aca.as_ref() {
+        append_aca(doc.as_table_mut(), aca);
+    }
     append_string_map(doc.as_table_mut(), "labels", &layer.labels);
     append_interp_map(doc.as_table_mut(), "env", &layer.env);
     doc.to_string()
@@ -184,7 +189,44 @@ fn environment_settings_to_layer(settings: &EnvironmentSettings) -> EnvironmentL
         lifecycle: lifecycle_settings_to_layer(&settings.lifecycle),
         labels:    StickyMap::from(settings.labels.clone()),
         env:       StickyMap::from(settings.env.clone()),
+        // ACA:
+        aca:       aca_settings_to_layer(&settings.aca),
     }
+}
+
+// ACA: mirrors `resources_settings_to_layer`'s all-default-omits-the-table
+// convention.
+fn aca_settings_to_layer(settings: &AcaEnvironmentSettings) -> Option<AcaEnvironmentLayer> {
+    let is_default = settings.region.is_none()
+        && settings.resource_group.is_none()
+        && settings.sandbox_group.is_none()
+        && settings.disk.is_none()
+        && !settings.region_override
+        && settings.egress.allow.is_empty()
+        && settings.egress.traffic_inspection.is_none()
+        && settings.auto_suspend.is_none();
+    if is_default {
+        return None;
+    }
+    Some(AcaEnvironmentLayer {
+        region:          settings.region.clone(),
+        resource_group:  settings.resource_group.clone(),
+        sandbox_group:   settings.sandbox_group.clone(),
+        disk:            settings.disk.clone(),
+        region_override: settings.region_override.then_some(true),
+        egress:          aca_egress_settings_to_layer(&settings.egress),
+        auto_suspend:    settings.auto_suspend,
+    })
+}
+
+fn aca_egress_settings_to_layer(settings: &AcaEgressSettings) -> Option<AcaEgressLayer> {
+    if settings.allow.is_empty() && settings.traffic_inspection.is_none() {
+        return None;
+    }
+    Some(AcaEgressLayer {
+        allow:              settings.allow.clone(),
+        traffic_inspection: settings.traffic_inspection.clone(),
+    })
 }
 
 fn image_settings_to_layer(settings: &EnvironmentImageSettings) -> Option<EnvironmentImageLayer> {
@@ -293,6 +335,38 @@ fn append_lifecycle(root: &mut Table, lifecycle: &EnvironmentLifecycleLayer) {
     }
     if let Some(auto_stop) = lifecycle.auto_stop {
         table["auto_stop"] = value(auto_stop.to_string());
+    }
+}
+
+// ACA:
+fn append_aca(root: &mut Table, aca: &AcaEnvironmentLayer) {
+    let table = ensure_table(root, &["aca"]);
+    if let Some(region) = aca.region.as_deref() {
+        table["region"] = value(region);
+    }
+    if let Some(resource_group) = aca.resource_group.as_deref() {
+        table["resource_group"] = value(resource_group);
+    }
+    if let Some(sandbox_group) = aca.sandbox_group.as_deref() {
+        table["sandbox_group"] = value(sandbox_group);
+    }
+    if let Some(disk) = aca.disk.as_deref() {
+        table["disk"] = value(disk);
+    }
+    if let Some(region_override) = aca.region_override {
+        table["region_override"] = value(region_override);
+    }
+    if let Some(auto_suspend) = aca.auto_suspend {
+        table["auto_suspend"] = value(auto_suspend.to_string());
+    }
+    if let Some(egress) = aca.egress.as_ref() {
+        let egress_table = ensure_table(table, &["egress"]);
+        if !egress.allow.is_empty() {
+            egress_table["allow"] = string_array(&egress.allow);
+        }
+        if let Some(traffic_inspection) = egress.traffic_inspection.as_deref() {
+            egress_table["traffic_inspection"] = value(traffic_inspection);
+        }
     }
 }
 

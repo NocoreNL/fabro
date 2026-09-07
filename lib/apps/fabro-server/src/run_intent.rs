@@ -242,10 +242,15 @@ pub(crate) fn pin_workflow_environment_authority(layer: &mut SettingsLayer, envi
             lifecycle: _,
             labels: _,
             env: _,
+            // ACA: resource_group/sandbox_group/region are ops-provisioned
+            // infrastructure identity, same authority class as `image` —
+            // cleared, not left for the workflow layer to override.
+            aca,
         } = environment;
         *provider = None;
         *cwd = None;
         *image = None;
+        *aca = None;
     }
     if let Some(environment) = layer.run.as_mut().and_then(|run| run.environment.as_mut()) {
         let RunEnvironmentLayer {

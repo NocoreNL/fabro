@@ -120,6 +120,8 @@ pub struct ServerSandboxProvidersSettings {
     pub local:   ServerSandboxProviderSettings,
     pub docker:  ServerSandboxProviderSettings,
     pub daytona: ServerSandboxProviderSettings,
+    // ACA: server-owned policy entry, always present like the other providers.
+    pub aca:     ServerSandboxProviderSettings,
 }
 
 impl ServerSandboxProvidersSettings {
@@ -133,6 +135,8 @@ impl ServerSandboxProvidersSettings {
             crate::SandboxProviderKind::Local => &self.local,
             crate::SandboxProviderKind::Docker => &self.docker,
             crate::SandboxProviderKind::Daytona => &self.daytona,
+            // ACA:
+            crate::SandboxProviderKind::Aca => &self.aca,
         }
     }
 }

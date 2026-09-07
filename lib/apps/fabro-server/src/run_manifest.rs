@@ -17,7 +17,13 @@ use fabro_graphviz::graph::{Graph, is_llm_handler_type};
 use fabro_graphviz::render::apply_direction;
 use fabro_llm::model_test::{ModelTestStatus, run_basic_model_probe};
 use fabro_model::{Catalog, ProviderId};
+// ACA:
+#[cfg(feature = "aca")]
+use fabro_sandbox::aca::AcaConfig;
 use fabro_sandbox::daytona::DaytonaConfig;
+// ACA:
+#[cfg(feature = "aca")]
+use fabro_sandbox::from_environment::aca_config_from_environment;
 use fabro_sandbox::from_environment::{
     daytona_config_from_environment, docker_config_from_environment,
     local_working_directory_from_environment,
@@ -673,6 +679,16 @@ fn resolve_daytona_config(settings: &RunNamespace) -> DaytonaConfig {
     daytona_config_from_environment(&settings.environment, &settings.clone)
 }
 
+// ACA: unlike `resolve_daytona_config`/`resolve_docker_config`, this takes no
+// `&settings.clone` — `aca_config_from_environment` only needs the
+// environment settings (`AcaConfig` has no `skip_clone`; ACA sandboxes always
+// start from their pre-baked disk image, regardless of the run's clone
+// settings).
+#[cfg(feature = "aca")]
+fn resolve_aca_config(settings: &RunNamespace) -> AcaConfig {
+    aca_config_from_environment(&settings.environment)
+}
+
 fn resolve_docker_config(settings: &RunNamespace) -> DockerSandboxOptions {
     docker_config_from_environment(&settings.environment, &settings.clone)
 }
@@ -685,7 +701,10 @@ struct GitRemoteRefCheck {
 
 fn clone_disabled_for_provider(provider: SandboxProviderKind, resolved_run: &RunNamespace) -> bool {
     match provider {
-        SandboxProviderKind::Docker | SandboxProviderKind::Daytona => !resolved_run.clone.enabled,
+        // ACA: clone-based like Daytona.
+        SandboxProviderKind::Docker | SandboxProviderKind::Daytona | SandboxProviderKind::Aca => {
+            !resolved_run.clone.enabled
+        }
         SandboxProviderKind::Local => false,
     }
 }
@@ -745,6 +764,13 @@ fn environment_capability_warnings(resolved_run: &RunNamespace) -> Vec<String> {
         EnvironmentProvider::Daytona => {
             if environment.cwd.is_some() {
                 warnings.push("daytona provider ignores cwd".to_string());
+            }
+        }
+        // ACA: mirrors the Daytona arm until ACA-specific capability warnings
+        // land (Task 8).
+        EnvironmentProvider::Aca => {
+            if environment.cwd.is_some() {
+                warnings.push("aca provider ignores cwd".to_string());
             }
         }
     }
@@ -951,6 +977,30 @@ fn preflight_sandbox_spec(
                 clone_tag: None,
                 clone_commit_sha: None,
                 api_key: daytona_api_key,
+            }
+        }
+        // ACA: preflight never requests a pinned tag/commit (both hard-coded
+        // `None` in the Docker/Daytona arms above too), so unlike
+        // `start.rs`'s `RunSession::new` there is no pin request to reject
+        // here.
+        SandboxProviderKind::Aca => {
+            #[cfg(feature = "aca")]
+            {
+                let config = resolve_aca_config(resolved_run);
+                SandboxSpec::Aca {
+                    config: Box::new(config),
+                    github_app,
+                    run_id: None,
+                    clone_origin_url,
+                    clone_branch,
+                }
+            }
+            #[cfg(not(feature = "aca"))]
+            {
+                return Err(fabro_sandbox::Error::message(
+                    "Aca sandbox provider is not enabled in this build (rebuild with `--features \
+                     aca`)",
+                ));
             }
         }
     })
@@ -2243,6 +2293,44 @@ provider = "local"
                 assert_eq!(clone_branch.as_deref(), Some("main"));
             }
             _ => panic!("expected Docker preflight sandbox spec"),
+        }
+    }
+
+    // ACA: mirrors `preflight_sandbox_spec_disables_docker_clone_but_preserves_clone_metadata`
+    // above, proving a `provider = "aca"` `RunNamespace` resolves through
+    // `preflight_sandbox_spec` into a real `SandboxSpec::Aca` (T4's fail-closed
+    // stub is gone). `AcaConfig` has no `skip_clone` to assert on (see
+    // `resolve_aca_config`'s doc comment), so this only checks clone metadata.
+    #[cfg(feature = "aca")]
+    #[test]
+    fn preflight_sandbox_spec_builds_aca_spec_from_environment() {
+        let (prepared, resolved) = prepared_and_resolved_for_sandbox(
+            SandboxProviderKind::Aca,
+            true,
+            Some(git_context("https://github.com/acme/widgets", "main")),
+        );
+
+        let spec = preflight_sandbox_spec(
+            SandboxProviderKind::Aca,
+            &prepared,
+            &resolved,
+            None,
+            None,
+        );
+
+        match spec {
+            Ok(SandboxSpec::Aca {
+                clone_origin_url,
+                clone_branch,
+                ..
+            }) => {
+                assert_eq!(
+                    clone_origin_url.as_deref(),
+                    Some("https://github.com/acme/widgets")
+                );
+                assert_eq!(clone_branch.as_deref(), Some("main"));
+            }
+            _ => panic!("expected Aca preflight sandbox spec"),
         }
     }
 

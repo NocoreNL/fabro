@@ -1,6 +1,8 @@
 pub mod config;
 pub mod error;
-#[cfg(any(feature = "docker", feature = "daytona"))]
+// ACA: aca_config_from_environment lives here too, so this module must also
+// compile when only the `aca` feature is enabled.
+#[cfg(any(feature = "docker", feature = "daytona", feature = "aca"))]
 pub mod from_environment;
 pub mod provider;
 pub mod sandbox;
@@ -32,6 +34,10 @@ pub mod docker;
 #[cfg(feature = "daytona")]
 pub mod daytona;
 
+// ACA:
+#[cfg(feature = "aca")]
+pub mod aca;
+
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
@@ -47,6 +53,9 @@ pub use git_retry::{
     CredentialContext, GitRetryReason, RetryPlan, classify_failure, retry_git_operation,
 };
 pub use local::LocalSandbox;
+// ACA:
+#[cfg(feature = "aca")]
+pub use provider::aca::{AcaAccount, AcaSandboxProvider};
 #[cfg(feature = "daytona")]
 pub use provider::daytona::DaytonaSandboxProvider;
 #[cfg(feature = "docker")]

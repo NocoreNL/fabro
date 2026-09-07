@@ -133,3 +133,15 @@ pub struct DaytonaSnapshotSettings {
     pub disk:   Option<i32>,
     pub source: DaytonaSnapshotSource,
 }
+
+// ACA: settings consumed by `aca_config_from_environment`
+// (`from_environment.rs`) to build an `AcaConfig`. Unlike `DaytonaSettings`
+// above — a fabro-sandbox-local type never fed by the environment TOML,
+// only ever constructed by its mapper — ACA's region/resource_group/
+// sandbox_group/disk/egress knobs *are* per-environment TOML data (parsed
+// via `fabro_config::EnvironmentLayer`'s `[aca]` table into
+// `EnvironmentSettings`/`RunEnvironmentSettings`), so the canonical struct
+// lives in `fabro_types::settings::run` alongside `RunEnvironmentSettings`.
+// This re-export keeps an `AcaSettings` name available from this module for
+// callers, mirroring where `DaytonaSettings` is found.
+pub use fabro_types::settings::run::{AcaEgressSettings, AcaEnvironmentSettings as AcaSettings};

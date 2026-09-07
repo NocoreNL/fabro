@@ -68,9 +68,15 @@ use fabro_mcp_store::McpServerStore;
 use fabro_model::catalog::LlmCatalogSettings;
 use fabro_model::{BilledTokenCounts, Catalog, ModelRef, ModelTestMode, ProviderId};
 use fabro_redact::redact_jsonl_line;
+// ACA:
+#[cfg(feature = "aca")]
+use fabro_sandbox::aca::{ACA_TOKEN_AUDIENCE, EntraTokenSource};
 use fabro_sandbox::daytona::{self, DaytonaSandbox};
 use fabro_sandbox::details::sandbox_details;
 use fabro_sandbox::reconnect::reconnect_for_run;
+// ACA:
+#[cfg(feature = "aca")]
+use fabro_sandbox::{AcaAccount, AcaSandboxProvider};
 use fabro_sandbox::{
     DaytonaSandboxProvider, DockerSandboxProvider, LocalSandboxProvider, Sandbox, SandboxProvider,
     SandboxProviderRegistry,
@@ -2338,6 +2344,38 @@ fn worker_token_keys_from_server_secrets(
         .map_err(|err| jwt_auth::session_secret_key_error(&err))
 }
 
+// ACA: reads the account-level scoping `AcaSandboxProvider` needs
+// (subscription/resourceGroup/sandboxGroup/region — see
+// `provider::aca::AcaAccount`'s doc comment for why `get`/`list`/`delete`
+// need these even though they only take a sandbox id). Mirrors how Daytona's
+// registry construction below reads DAYTONA_API_URL/DAYTONA_ORGANIZATION_ID
+// via the same `env_lookup`. Returns `None` (provider simply absent, no
+// panic) when any of the four is unset — mirrors Daytona's
+// `daytona_api_key.is_some()` gate.
+#[cfg(feature = "aca")]
+fn aca_account_from_env(env_lookup: &EnvLookup) -> Option<AcaAccount> {
+    Some(AcaAccount {
+        subscription:   env_lookup(EnvVars::ACA_SUBSCRIPTION_ID)?,
+        resource_group: env_lookup(EnvVars::ACA_RESOURCE_GROUP)?,
+        sandbox_group:  env_lookup(EnvVars::ACA_SANDBOX_GROUP)?,
+        region:         env_lookup(EnvVars::ACA_REGION)?,
+    })
+}
+
+// ACA: `AcaSandboxProvider::new` takes a concrete `HttpClient` (unlike
+// `DaytonaSandboxProvider::new`'s `Option<HttpClient>`), so this resolves the
+// same "reuse the shared client, or build a fresh default one" fallback
+// `AppState::http_client` already uses elsewhere in this file.
+#[cfg(feature = "aca")]
+fn aca_http_client(
+    http_client: Option<fabro_http::HttpClient>,
+) -> Result<fabro_http::HttpClient, fabro_http::HttpClientBuildError> {
+    match http_client {
+        Some(client) => Ok(client),
+        None => fabro_http::http_client(),
+    }
+}
+
 fn build_sandbox_provider_registry(
     server_settings: &ServerSettings,
     daytona_api_key: Option<String>,
@@ -2346,6 +2384,10 @@ fn build_sandbox_provider_registry(
 ) -> SandboxProviderRegistry {
     let provider_settings = &server_settings.server.sandbox.providers;
     let mut providers: Vec<Arc<dyn SandboxProvider>> = Vec::new();
+    // ACA: cloned up front, before Daytona's block below moves `http_client`
+    // (by value) into `DaytonaSandboxProvider::new`.
+    #[cfg(feature = "aca")]
+    let aca_http_client_source = http_client.clone();
 
     if provider_settings.local.enabled {
         providers.push(Arc::new(LocalSandboxProvider));
@@ -2365,6 +2407,36 @@ fn build_sandbox_provider_registry(
             organization_id,
             http_client,
         )));
+    }
+
+    // ACA:
+    #[cfg(feature = "aca")]
+    if provider_settings.aca.enabled {
+        if let Some(account) = aca_account_from_env(env_lookup) {
+            match aca_http_client(aca_http_client_source) {
+                Ok(http) => match EntraTokenSource::new(ACA_TOKEN_AUDIENCE) {
+                    Ok(token_source) => {
+                        providers.push(Arc::new(AcaSandboxProvider::new(
+                            Arc::new(token_source),
+                            http,
+                            account,
+                        )));
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "failed to build Entra token source; ACA sandbox provider disabled"
+                        );
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "failed to build HTTP client; ACA sandbox provider disabled"
+                    );
+                }
+            }
+        }
     }
 
     SandboxProviderRegistry::new(providers)

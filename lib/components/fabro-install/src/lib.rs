@@ -492,6 +492,10 @@ fn write_sandbox_provider_policy(
             SandboxProviderKind::Local => allow_local,
             SandboxProviderKind::Docker => selection == InstallSandboxSelection::Docker,
             SandboxProviderKind::Daytona => selection == InstallSandboxSelection::Daytona,
+            // ACA: not yet a selectable install-wizard option (no
+            // `InstallSandboxSelection::Aca`) and not in the loop above, so
+            // this arm is unreachable for now; default to disabled.
+            SandboxProviderKind::Aca => false,
         };
         let entry = ensure_table(providers, &provider.to_string())?;
         entry.insert("enabled".to_string(), toml::Value::Boolean(enabled));

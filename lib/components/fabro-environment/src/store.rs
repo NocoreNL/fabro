@@ -82,6 +82,40 @@ preserve = false
 stop_on_terminal = true
 "#;
 
+// ACA: no `[image]` table — ACA sandboxes select a base OS via `[aca].disk`
+// (see below), not a Docker image/Dockerfile.
+// ACA: `memory` is a binary size ("4GiB"), not decimal ("4GB") like the
+// Docker/Daytona defaults above — the ACA data-plane create body wants
+// mebibytes (`from_environment.rs`'s `aca_memory_string`, per
+// `docs/aca-data-plane-api.md`'s create section), and "4GiB" is exactly
+// 4096 MiB, while decimal "4GB" would round to a non-clean "3815Mi".
+const ACA_DEFAULT_ENVIRONMENT_TOML: &str = r#"provider = "aca"
+
+[resources]
+cpu = 2
+memory = "4GiB"
+
+[lifecycle]
+preserve = false
+stop_on_terminal = true
+
+[aca]
+region = "northeurope"
+# ACA: resource_group/sandbox_group are ops-provisioned out of band (e.g.
+# `az group create` + `aca sandboxgroup create`), never created by Fabro
+# itself. Auth is via azure_identity's DefaultAzureCredential, so no
+# secrets are stored here; the identity Fabro runs as needs the
+# "Container Apps SandboxGroup Data Owner" RBAC role on the sandbox group.
+resource_group = "REPLACE_WITH_OPS_PROVISIONED_RESOURCE_GROUP"
+sandbox_group = "REPLACE_WITH_OPS_PROVISIONED_SANDBOX_GROUP"
+disk = "ubuntu"
+auto_suspend = "30m"
+
+[aca.egress]
+allow = ["*.github.com", "api.anthropic.com"]
+traffic_inspection = "Full"
+"#;
+
 #[derive(Debug)]
 pub struct EnvironmentStore {
     pool:      DbPool,
@@ -330,6 +364,10 @@ fn environment_from_row(row: &SqliteRow) -> Result<Environment, EnvironmentStore
             &labels_json,
         )?),
         env:       StickyMap::from(decode_env_json(&env_json)?),
+        // ACA: `EnvironmentSqlRow` has no columns for `[aca]` settings yet
+        // (follow-up: a schema migration to persist them), so a row loaded
+        // from SQLite always resolves to the default (inert) `aca` value.
+        aca:       None,
     };
 
     Environment::from_row(id, revision, &layer)
@@ -609,6 +647,8 @@ pub async fn seed_default_environment(
         EnvironmentProvider::Docker => DEFAULT_ENVIRONMENT_TOML,
         EnvironmentProvider::Daytona => DAYTONA_DEFAULT_ENVIRONMENT_TOML,
         EnvironmentProvider::Local => LOCAL_ENVIRONMENT_TOML,
+        // ACA:
+        EnvironmentProvider::Aca => ACA_DEFAULT_ENVIRONMENT_TOML,
     };
     let layer: EnvironmentLayer = toml::from_str(content).map_err(|source| {
         EnvironmentStoreError::parse(PathBuf::from("built-in-default-environment.toml"), source)
@@ -831,4 +871,50 @@ fn decode_env_json(value: &str) -> Result<HashMap<String, InterpString>, Environ
 
 fn row_count(count: usize) -> Result<i64, EnvironmentStoreError> {
     i64::try_from(count).map_err(|_| EnvironmentStoreError::RowCountOverflow { count })
+}
+
+// ACA:
+#[cfg(test)]
+mod aca_default_environment_tests {
+    use fabro_config::EnvironmentLayer;
+    use fabro_types::settings::run::EnvironmentProvider;
+
+    use super::ACA_DEFAULT_ENVIRONMENT_TOML;
+
+    #[test]
+    fn aca_default_environment_toml_parses_with_real_values() {
+        let layer: EnvironmentLayer = toml::from_str(ACA_DEFAULT_ENVIRONMENT_TOML)
+            .expect("aca default environment toml should parse");
+        let settings = fabro_config::resolve_environment_layer(&layer, "environment")
+            .expect("aca default environment toml should resolve");
+
+        assert_eq!(settings.provider, EnvironmentProvider::Aca);
+        // ACA: confirms the default TOML's resources resolve to values that
+        // yield a contract-valid data-plane create body once mapped by
+        // `fabro-sandbox`'s `aca_config_from_environment`
+        // (`aca_cpu_string`/`aca_memory_string`): cpu=2 -> "2000m",
+        // memory="4GiB" (4294967296 bytes) -> "4096Mi" exactly. This crate
+        // has no dependency on fabro-sandbox, so it checks the resolved
+        // `resources` fields those functions consume rather than their
+        // output strings directly.
+        assert_eq!(settings.resources.cpu, Some(2));
+        assert_eq!(
+            settings.resources.memory.map(|size| size.as_bytes()),
+            Some(4 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(settings.aca.disk.as_deref(), Some("ubuntu"));
+        assert_eq!(
+            settings.aca.egress.traffic_inspection.as_deref(),
+            Some("Full")
+        );
+        assert_eq!(
+            settings.aca.egress.allow,
+            vec!["*.github.com".to_string(), "api.anthropic.com".to_string()]
+        );
+        // `northeurope` is a known ACA data-plane region (see
+        // fabro-sandbox's `aca::ACA_DATA_PLANE_REGIONS`, which
+        // fabro-environment doesn't depend on and so can't check directly).
+        assert_eq!(settings.aca.region.as_deref(), Some("northeurope"));
+        assert!(!settings.aca.region_override);
+    }
 }

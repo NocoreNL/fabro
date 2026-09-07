@@ -79,6 +79,10 @@ fn resolve_sandbox(layer: Option<&ServerSandboxLayer>) -> ServerSandboxSettings 
             daytona: resolve_sandbox_provider(
                 providers.and_then(|providers| providers.daytona.as_ref()),
             ),
+            // ACA:
+            aca:     resolve_sandbox_provider(
+                providers.and_then(|providers| providers.aca.as_ref()),
+            ),
         },
     }
 }

@@ -106,6 +106,13 @@ impl EnvVars {
     pub const AWS_SECRET_ACCESS_KEY: &'static str = "AWS_SECRET_ACCESS_KEY";
     pub const AWS_SESSION_TOKEN: &'static str = "AWS_SESSION_TOKEN";
     pub const AWS_WEB_IDENTITY_TOKEN_FILE: &'static str = "AWS_WEB_IDENTITY_TOKEN_FILE";
+    // ACA: account-level scoping for the server's `AcaSandboxProvider`
+    // registry construction (see `fabro-server/src/server.rs`); mirrors how
+    // DAYTONA_API_URL/DAYTONA_ORGANIZATION_ID are read below.
+    pub const ACA_SUBSCRIPTION_ID: &'static str = "ACA_SUBSCRIPTION_ID";
+    pub const ACA_RESOURCE_GROUP: &'static str = "ACA_RESOURCE_GROUP";
+    pub const ACA_SANDBOX_GROUP: &'static str = "ACA_SANDBOX_GROUP";
+    pub const ACA_REGION: &'static str = "ACA_REGION";
     pub const DAYTONA_API_KEY: &'static str = "DAYTONA_API_KEY";
     pub const DAYTONA_API_URL: &'static str = "DAYTONA_API_URL";
     pub const DAYTONA_ORGANIZATION_ID: &'static str = "DAYTONA_ORGANIZATION_ID";
@@ -250,6 +257,10 @@ mod tests {
             EnvVars::AWS_SECRET_ACCESS_KEY,
             EnvVars::AWS_SESSION_TOKEN,
             EnvVars::AWS_WEB_IDENTITY_TOKEN_FILE,
+            EnvVars::ACA_SUBSCRIPTION_ID,
+            EnvVars::ACA_RESOURCE_GROUP,
+            EnvVars::ACA_SANDBOX_GROUP,
+            EnvVars::ACA_REGION,
             EnvVars::DAYTONA_API_KEY,
             EnvVars::DAYTONA_API_URL,
             EnvVars::DAYTONA_ORGANIZATION_ID,

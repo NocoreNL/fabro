@@ -106,5 +106,7 @@ pub async fn reconnect_for_run_with_callback(
         }
         #[cfg(not(feature = "daytona"))]
         SandboxProviderKind::Daytona => bail!("Daytona sandbox support is not enabled"),
+        // ACA: no reconnect implementation yet in either build (Task 8).
+        SandboxProviderKind::Aca => bail!("Aca sandbox support is not yet implemented"),
     }
 }
