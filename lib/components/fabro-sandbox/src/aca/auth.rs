@@ -51,9 +51,20 @@ impl EntraTokenSource {
 #[async_trait::async_trait]
 impl TokenSource for EntraTokenSource {
     async fn token(&self) -> crate::Result<String> {
+        // Azure AD v2 (`get_token`) takes an OAuth *scope*, not a bare
+        // resource. For a resource audience the scope is `<resource>/.default`
+        // (all of the resource's statically-consented permissions). Passing the
+        // bare resource makes the CLI credential append `openid profile
+        // offline_access`, which AAD rejects with AADSTS70011. Append
+        // `/.default` unless the caller already supplied it.
+        let scope = if self.audience.ends_with("/.default") {
+            self.audience.clone()
+        } else {
+            format!("{}/.default", self.audience.trim_end_matches('/'))
+        };
         let access_token = self
             .credential
-            .get_token(&[self.audience.as_str()], None)
+            .get_token(&[scope.as_str()], None)
             .await
             .map_err(|e| {
                 crate::Error::context("Failed to acquire Entra token for ACA audience", e)
