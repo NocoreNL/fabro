@@ -15,12 +15,21 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
   packages: write
 
 env:
   CARGO_TERM_COLOR: always
+  # cargo-zigbuild links libz-sys (pulled in transitively via git2) against
+  # musl; without this it fails to find/link a static libz for the musl
+  # target. Same fix release.yml uses for its musl matrix legs, and the same
+  # env var `cargo dev docker-build` injects for its zigbuild invocation.
+  LIBZ_SYS_STATIC: "1"
 
 jobs:
   build-and-push:
@@ -50,6 +59,18 @@ jobs:
         uses: taiki-e/install-action@773334c0e05d7e699e4d78234494308223f3a2cf # v2
         with:
           tool: cargo-zigbuild
+
+      # `cargo dev spa refresh` shells out to `bun run build` in
+      # apps/fabro-web (see spa_refresh.rs), so bun + its deps must be
+      # installed first. Same pinned setup-bun version + bun install
+      # release.yml and nightly.yml use ahead of this command.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+          no-cache: true
+
+      - name: Install bun deps
+        run: bun install --frozen-lockfile
 
       # The web UI is rust-embed'd from mirrored SPA assets that are
       # .gitkeep-only in git. Without this step the binary ships with no
