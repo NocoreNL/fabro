@@ -2,10 +2,24 @@
 -- Rebuild `environments` to (a) allow provider='aca' and (b) add [aca] columns.
 -- The provider CHECK cannot be altered in place; this is the SQLite 12-step
 -- table rebuild. `environments` has an inbound FK (automations.environment_id
--- REFERENCES environments(id) ON DELETE RESTRICT), and PRAGMA foreign_keys is a
--- no-op inside a transaction, so this migration runs WITHOUT the sqlx-wrapped
--- transaction and manages foreign_keys itself.
+-- REFERENCES environments(id) ON DELETE RESTRICT). PRAGMA foreign_keys is a
+-- no-op inside a transaction, so it is toggled OFF/ON outside the explicit
+-- BEGIN/COMMIT below; the rebuild itself (CREATE, copy, DROP, RENAME) runs
+-- inside that transaction so a crash mid-rebuild rolls back atomically
+-- instead of leaving the database with no `environments` table at all. This
+-- migration is declared `-- no-transaction` so sqlx does not also wrap it in
+-- its own transaction (which would make the PRAGMA toggles no-ops); the
+-- BEGIN/COMMIT pair below is the migration's only transaction.
+--
+-- SQLite foreign keys are resolved by table name, not by internal id, so
+-- `automations.environment_id`'s FK re-attaches to the rebuilt table purely
+-- because it is named `environments` again after the RENAME; no separate
+-- re-creation of the FK is needed. FK integrity and the data-copy step below
+-- are both exercised by `automations_fk_and_data_survive_environments_aca_rebuild`
+-- in `fabro-environment`'s `tests/store.rs`.
 PRAGMA foreign_keys=OFF;
+
+BEGIN;
 
 CREATE TABLE environments_new (
     id TEXT PRIMARY KEY NOT NULL,
@@ -65,5 +79,6 @@ FROM environments;
 DROP TABLE environments;
 ALTER TABLE environments_new RENAME TO environments;
 
-PRAGMA foreign_key_check;   -- must return no rows
+COMMIT;
+
 PRAGMA foreign_keys=ON;

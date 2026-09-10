@@ -384,14 +384,12 @@ fn environment_from_row(row: &SqliteRow) -> Result<Environment, EnvironmentStore
 
 // ACA: reconstructs the sparse `[aca]` layer from the row's `aca_*` columns,
 // mirroring `aca_settings_to_layer`'s all-default-omits-the-table convention
-// in `model.rs`. Triggers on `provider == "aca"` as the common case, but also
-// on any individual `aca_*` column carrying a non-default value, so a row
-// that somehow carries `[aca]` data under a different provider still round-
-// trips instead of silently losing it.
+// in `model.rs` exactly: both sides check the same eight fields and neither
+// looks at `provider`, so a row's `[aca]` layer is present after reload if
+// and only if the write path decided the settings were non-default.
 fn aca_layer_from_row(
     row: &SqliteRow,
 ) -> Result<Option<AcaEnvironmentLayer>, EnvironmentStoreError> {
-    let provider: String = row.get("provider");
     let region: Option<String> = row.get("aca_region");
     let resource_group: Option<String> = row.get("aca_resource_group");
     let sandbox_group: Option<String> = row.get("aca_sandbox_group");
@@ -402,8 +400,7 @@ fn aca_layer_from_row(
     let auto_suspend = parse_duration("aca_auto_suspend", row.get("aca_auto_suspend"))?;
     let allow: Vec<String> = decode_json("aca_egress_allow_json", &egress_allow_json)?;
 
-    let is_present = provider == "aca"
-        || region.is_some()
+    let is_present = region.is_some()
         || resource_group.is_some()
         || sandbox_group.is_some()
         || disk.is_some()
