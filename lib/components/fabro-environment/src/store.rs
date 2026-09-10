@@ -103,9 +103,10 @@ stop_on_terminal = true
 region = "northeurope"
 # ACA: resource_group/sandbox_group are ops-provisioned out of band (e.g.
 # `az group create` + `aca sandboxgroup create`), never created by Fabro
-# itself. Auth is via azure_identity's DefaultAzureCredential, so no
-# secrets are stored here; the identity Fabro runs as needs the
-# "Container Apps SandboxGroup Data Owner" RBAC role on the sandbox group.
+# itself. Identity auth is via azure_identity (DeveloperToolsCredential for
+# dev, ManagedIdentityCredential when ACA_AUTH_MODE=managed), so no
+# secrets are stored here; the identity Fabro runs as needs
+# "Container Apps SandboxGroup Data Owner" on the sandbox group.
 resource_group = "REPLACE_WITH_OPS_PROVISIONED_RESOURCE_GROUP"
 sandbox_group = "REPLACE_WITH_OPS_PROVISIONED_SANDBOX_GROUP"
 disk = "ubuntu"

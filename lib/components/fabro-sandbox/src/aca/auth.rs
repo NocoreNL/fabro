@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use azure_core::credentials::TokenCredential;
-use azure_identity::DeveloperToolsCredential;
+use azure_identity::{DeveloperToolsCredential, ManagedIdentityCredential};
 
 /// Yields a bearer token for the ACA data-plane audience.
 ///
@@ -17,18 +17,21 @@ pub trait TokenSource: Send + Sync {
     async fn token(&self) -> crate::Result<String>;
 }
 
-/// Production [`TokenSource`] backed by `azure_identity`'s developer-tools
-/// credential chain (Azure CLI, then Azure Developer CLI).
+/// Production [`TokenSource`] backed by `azure_identity`, selecting between
+/// two credential chains via the `ACA_AUTH_MODE` env var:
 ///
-/// `azure_identity` 1.x removed `DefaultAzureCredential` in favor of
+/// - `ACA_AUTH_MODE=managed` — [`ManagedIdentityCredential`] (system-assigned,
+///   via IMDS/App Service, no client id). Use this when the process itself
+///   runs as an Azure-hosted workload (e.g. the Fabro server on an Azure VM)
+///   and must authenticate to the ACA data plane as that VM's identity.
+/// - anything else, including unset — [`DeveloperToolsCredential`] (Azure
+///   CLI, then Azure Developer CLI), for local `az login` development.
+///
+/// `azure_identity` 1.x removed `DefaultAzureCredential` in favor of these
 /// audience-specific credential types (see the crate's CHANGELOG: "Replaced
-/// `DefaultAzureCredential` with `DeveloperToolsCredential`"). This picks
-/// `DeveloperToolsCredential` as the closest equivalent available today.
-/// It does not include `ManagedIdentityCredential`, so it won't authenticate
-/// when this process itself runs as an Azure-hosted workload — revisit once
-/// the deployment model for the ACA data-plane client is settled.
+/// `DefaultAzureCredential` with `DeveloperToolsCredential`").
 pub struct EntraTokenSource {
-    credential: Arc<DeveloperToolsCredential>,
+    credential: Arc<dyn TokenCredential>,
     audience:   String,
 }
 
@@ -38,9 +41,19 @@ impl EntraTokenSource {
     /// The audience is caller-supplied rather than hardcoded here; Task 2's
     /// capture doc (`docs/aca-data-plane-api.md`) confirms the real value.
     pub fn new(audience: impl Into<String>) -> crate::Result<Self> {
-        let credential = DeveloperToolsCredential::new(None).map_err(|e| {
-            crate::Error::context("Failed to build Entra developer-tools credential", e)
-        })?;
+        // ACA_AUTH_MODE=managed -> ManagedIdentityCredential (system-assigned via
+        // IMDS/App Service, no client id). Anything else (incl. unset) keeps the
+        // developer-tools credential for local `az login` dev.
+        let mode = std::env::var("ACA_AUTH_MODE").unwrap_or_default();
+        let credential: Arc<dyn TokenCredential> = if mode.eq_ignore_ascii_case("managed") {
+            ManagedIdentityCredential::new(None).map_err(|e| {
+                crate::Error::context("Failed to build Entra managed-identity credential", e)
+            })?
+        } else {
+            DeveloperToolsCredential::new(None).map_err(|e| {
+                crate::Error::context("Failed to build Entra developer-tools credential", e)
+            })?
+        };
         Ok(Self {
             credential,
             audience: audience.into(),
@@ -97,5 +110,16 @@ mod tests {
     async fn fake_token_source_returns_token() {
         let ts = FakeTokenSource("test-token".to_string());
         assert_eq!(ts.token().await.unwrap(), "test-token");
+    }
+
+    #[test]
+    fn new_selects_credential_by_aca_auth_mode() {
+        // developer mode (default) builds a source
+        std::env::remove_var("ACA_AUTH_MODE");
+        assert!(EntraTokenSource::new("https://management.azuredevcompute.io").is_ok());
+        // managed mode builds a source too (IMDS is only hit on token(), not new())
+        std::env::set_var("ACA_AUTH_MODE", "managed");
+        assert!(EntraTokenSource::new("https://management.azuredevcompute.io").is_ok());
+        std::env::remove_var("ACA_AUTH_MODE");
     }
 }
