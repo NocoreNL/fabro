@@ -80,6 +80,14 @@ _version = 1
 
 [server.auth]
 methods = ["dev-token"]
+
+# ACA: like every other sandbox provider, `aca` defaults to enabled; since
+# `--features aca` now hard-fails startup when it's enabled without its
+# ACA_* account env vars (see `build_sandbox_provider_registry`), the shared
+# test default explicitly opts out so tests unrelated to ACA keep building
+# `AppState` without configuring an ACA account.
+[server.sandbox.providers.aca]
+enabled = false
 "#,
     )
     .expect("default test server settings should resolve")
@@ -258,6 +266,19 @@ impl TestAppStateBuilder {
         let (store, artifact_store) = self.store_bundle.unwrap_or_else(test_store_bundle);
         let vault_path = self.vault_path.unwrap_or_else(test_secret_store_path);
         self.server_settings = redirect_default_storage_root(self.server_settings, &vault_path)?;
+        // ACA: an enabled-but-unconfigured `aca` provider is now a hard
+        // startup error (see `build_sandbox_provider_registry` in
+        // server.rs) instead of a silent warn-and-drop. The config resolver
+        // defaults every sandbox provider, `aca` included, to `enabled =
+        // true` when a test's fixture TOML doesn't mention it, and this
+        // builder backs 100+ call sites across the crate whose fixtures
+        // predate ACA and never set ACA_* account env. Force it off here so
+        // those fixtures keep building `AppState` under `--features aca`; a
+        // test that wants real ACA coverage should exercise
+        // `build_sandbox_provider_registry` directly (see
+        // `aca_enabled_without_account_env_is_a_hard_startup_error`) or
+        // supply an explicit `.sandbox_provider_registry(...)` override.
+        self.server_settings.server.sandbox.providers.aca.enabled = false;
         if !self.vault_entries.is_empty() {
             let mut vault = Vault::load(vault_path.clone()).expect("test vault should load");
             for (name, value) in &self.vault_entries {

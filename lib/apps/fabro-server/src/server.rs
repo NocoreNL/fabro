@@ -2381,7 +2381,7 @@ fn build_sandbox_provider_registry(
     daytona_api_key: Option<String>,
     env_lookup: &EnvLookup,
     http_client: Option<fabro_http::HttpClient>,
-) -> SandboxProviderRegistry {
+) -> anyhow::Result<SandboxProviderRegistry> {
     let provider_settings = &server_settings.server.sandbox.providers;
     let mut providers: Vec<Arc<dyn SandboxProvider>> = Vec::new();
     // ACA: cloned up front, before Daytona's block below moves `http_client`
@@ -2412,8 +2412,8 @@ fn build_sandbox_provider_registry(
     // ACA:
     #[cfg(feature = "aca")]
     if provider_settings.aca.enabled {
-        if let Some(account) = aca_account_from_env(env_lookup) {
-            match aca_http_client(aca_http_client_source) {
+        match aca_account_from_env(env_lookup) {
+            Some(account) => match aca_http_client(aca_http_client_source) {
                 Ok(http) => match EntraTokenSource::new(ACA_TOKEN_AUDIENCE) {
                     Ok(token_source) => {
                         providers.push(Arc::new(AcaSandboxProvider::new(
@@ -2435,11 +2435,23 @@ fn build_sandbox_provider_registry(
                         "failed to build HTTP client; ACA sandbox provider disabled"
                     );
                 }
+            },
+            // Enabled-but-unconfigured is a startup preflight failure, not a
+            // silent drop: this is the case that used to boot healthy with no
+            // `aca` provider and fail later with an unrelated-looking error
+            // (SP2 spec DoD #5). The two branches above (HTTP client / Entra
+            // token source construction) stay warn-and-drop — this preflight
+            // only covers the missing-account case.
+            None => {
+                anyhow::bail!(
+                    "sandbox provider `aca` is enabled but ACA_SUBSCRIPTION_ID/\
+                     ACA_RESOURCE_GROUP/ACA_SANDBOX_GROUP/ACA_REGION are not all set"
+                );
             }
         }
     }
 
-    SandboxProviderRegistry::new(providers)
+    Ok(SandboxProviderRegistry::new(providers))
 }
 
 pub(crate) fn automation_dir_for_active_config(active_config_path: &std::path::Path) -> PathBuf {
@@ -2562,14 +2574,15 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         Catalog::from_builtin_with_overrides(&resolved_settings.llm_catalog_settings)
             .context("building LLM model catalog")?,
     );
-    let sandbox_provider_registry = sandbox_provider_registry.unwrap_or_else(|| {
-        build_sandbox_provider_registry(
+    let sandbox_provider_registry = match sandbox_provider_registry {
+        Some(registry) => registry,
+        None => build_sandbox_provider_registry(
             current_server_settings.as_ref(),
             daytona_api_key,
             &env_lookup,
             http_client.clone(),
-        )
-    });
+        )?,
+    };
     let slack_service = {
         let slack_settings = &current_server_settings.server.integrations.slack;
         if slack_settings.enabled {

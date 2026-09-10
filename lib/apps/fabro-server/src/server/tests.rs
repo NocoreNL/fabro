@@ -1376,6 +1376,44 @@ enabled = false
 }
 
 #[test]
+#[cfg(feature = "aca")]
+fn aca_enabled_without_account_env_is_a_hard_startup_error() {
+    let settings = server_settings_from_toml(
+        r#"
+_version = 1
+
+[server.auth]
+methods = ["dev-token"]
+
+[server.sandbox.providers.aca]
+enabled = true
+"#,
+    );
+    // A deliberately empty lookup (rather than the process env) so this test
+    // cannot depend on — or be broken by — ACA_* vars that happen to be set
+    // in the ambient process environment.
+    let no_env: EnvLookup = Arc::new(|_: &str| None);
+
+    let Err(err) = build_sandbox_provider_registry(&settings, None, &no_env, None) else {
+        panic!("aca enabled without ACA_* account env should be a hard startup error");
+    };
+
+    let message = err.to_string();
+    for needle in [
+        "aca",
+        "ACA_SUBSCRIPTION_ID",
+        "ACA_RESOURCE_GROUP",
+        "ACA_SANDBOX_GROUP",
+        "ACA_REGION",
+    ] {
+        assert!(
+            message.contains(needle),
+            "expected error to mention `{needle}`, got: {message}"
+        );
+    }
+}
+
+#[test]
 fn clone_sandbox_credentials_are_available_for_clone_based_providers() {
     use fabro_types::settings::run::EnvironmentProvider;
     assert!(EnvironmentProvider::Docker.is_clone_based());
@@ -2136,6 +2174,11 @@ methods = ["dev-token"]
 
 [server.integrations.slack]
 enabled = true
+
+# ACA: not under test here; disable explicitly so `--features aca` builds
+# don't hit the enabled-but-unconfigured startup preflight error.
+[server.sandbox.providers.aca]
+enabled = false
 "#,
         ),
         &[
@@ -2178,6 +2221,11 @@ methods = ["dev-token"]
 [server.integrations.slack]
 enabled = true
 default_channel = "#releases"
+
+# ACA: not under test here; disable explicitly so `--features aca` builds
+# don't hit the enabled-but-unconfigured startup preflight error.
+[server.sandbox.providers.aca]
+enabled = false
 "##,
         ),
         &slack_test_vault_tokens(),
@@ -2583,6 +2631,12 @@ _version = 1
 
 [server.auth]
 methods = ["dev-token"]
+
+# ACA: not under test here; disable explicitly so `--features aca` builds
+# don't hit the enabled-but-unconfigured startup preflight error before this
+# test's session-secret check runs.
+[server.sandbox.providers.aca]
+enabled = false
 "#,
     );
     let (store, artifact_store) = test_store_bundle();
@@ -7700,6 +7754,11 @@ methods = ["dev-token"]
 
 [server.integrations.github]
 strategy = "token"
+
+# ACA: not under test here; disable explicitly so `--features aca` builds
+# don't hit the enabled-but-unconfigured startup preflight error.
+[server.sandbox.providers.aca]
+enabled = false
 "#,
     )
     .expect("github token settings fixture should resolve")
