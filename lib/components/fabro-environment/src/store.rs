@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use fabro_config::{
-    EnvironmentDockerfileLayer, EnvironmentImageLayer, EnvironmentLayer, EnvironmentLifecycleLayer,
-    EnvironmentNetworkLayer, EnvironmentResourcesLayer, MergeMap, StickyMap,
+    AcaEgressLayer, AcaEnvironmentLayer, EnvironmentDockerfileLayer, EnvironmentImageLayer,
+    EnvironmentLayer, EnvironmentLifecycleLayer, EnvironmentNetworkLayer,
+    EnvironmentResourcesLayer, MergeMap, StickyMap,
 };
 use fabro_db::DbPool;
 use fabro_types::settings::run::{DockerfileSource, EnvironmentProvider, EnvironmentSettings};
@@ -310,7 +311,15 @@ async fn load_environments(
             lifecycle_stop_on_terminal,
             lifecycle_auto_stop,
             labels_json,
-            env_json
+            env_json,
+            aca_region,
+            aca_resource_group,
+            aca_sandbox_group,
+            aca_disk,
+            aca_region_override,
+            aca_egress_allow_json,
+            aca_egress_traffic_inspection,
+            aca_auto_suspend
         FROM environments
         ORDER BY id
         ",
@@ -365,13 +374,65 @@ fn environment_from_row(row: &SqliteRow) -> Result<Environment, EnvironmentStore
             &labels_json,
         )?),
         env:       StickyMap::from(decode_env_json(&env_json)?),
-        // ACA: `EnvironmentSqlRow` has no columns for `[aca]` settings yet
-        // (follow-up: a schema migration to persist them), so a row loaded
-        // from SQLite always resolves to the default (inert) `aca` value.
-        aca:       None,
+        // ACA: built from the `aca_*` columns below; `None` (the default)
+        // for any environment that never had `[aca]` settings persisted.
+        aca:       aca_layer_from_row(row)?,
     };
 
     Environment::from_row(id, revision, &layer)
+}
+
+// ACA: reconstructs the sparse `[aca]` layer from the row's `aca_*` columns,
+// mirroring `aca_settings_to_layer`'s all-default-omits-the-table convention
+// in `model.rs`. Triggers on `provider == "aca"` as the common case, but also
+// on any individual `aca_*` column carrying a non-default value, so a row
+// that somehow carries `[aca]` data under a different provider still round-
+// trips instead of silently losing it.
+fn aca_layer_from_row(
+    row: &SqliteRow,
+) -> Result<Option<AcaEnvironmentLayer>, EnvironmentStoreError> {
+    let provider: String = row.get("provider");
+    let region: Option<String> = row.get("aca_region");
+    let resource_group: Option<String> = row.get("aca_resource_group");
+    let sandbox_group: Option<String> = row.get("aca_sandbox_group");
+    let disk: Option<String> = row.get("aca_disk");
+    let region_override: bool = row.get("aca_region_override");
+    let egress_allow_json: String = row.get("aca_egress_allow_json");
+    let traffic_inspection: Option<String> = row.get("aca_egress_traffic_inspection");
+    let auto_suspend = parse_duration("aca_auto_suspend", row.get("aca_auto_suspend"))?;
+    let allow: Vec<String> = decode_json("aca_egress_allow_json", &egress_allow_json)?;
+
+    let is_present = provider == "aca"
+        || region.is_some()
+        || resource_group.is_some()
+        || sandbox_group.is_some()
+        || disk.is_some()
+        || region_override
+        || !allow.is_empty()
+        || traffic_inspection.is_some()
+        || auto_suspend.is_some();
+    if !is_present {
+        return Ok(None);
+    }
+
+    let egress = if allow.is_empty() && traffic_inspection.is_none() {
+        None
+    } else {
+        Some(AcaEgressLayer {
+            allow,
+            traffic_inspection,
+        })
+    };
+
+    Ok(Some(AcaEnvironmentLayer {
+        region,
+        resource_group,
+        sandbox_group,
+        disk,
+        region_override: region_override.then_some(true),
+        egress,
+        auto_suspend,
+    }))
 }
 
 fn image_layer_from_row(row: &SqliteRow) -> Option<EnvironmentImageLayer> {
@@ -503,6 +564,14 @@ async fn execute_environment_insert_sql(
         .bind(row.lifecycle_auto_stop)
         .bind(row.labels_json)
         .bind(row.env_json)
+        .bind(row.aca_region)
+        .bind(row.aca_resource_group)
+        .bind(row.aca_sandbox_group)
+        .bind(row.aca_disk)
+        .bind(row.aca_region_override)
+        .bind(row.aca_egress_allow_json)
+        .bind(row.aca_egress_traffic_inspection)
+        .bind(row.aca_auto_suspend)
         .execute(&mut **transaction)
         .await?;
     Ok(result.rows_affected())
@@ -530,6 +599,14 @@ async fn update_environment(
         .bind(row.lifecycle_auto_stop)
         .bind(row.labels_json)
         .bind(row.env_json)
+        .bind(row.aca_region)
+        .bind(row.aca_resource_group)
+        .bind(row.aca_sandbox_group)
+        .bind(row.aca_disk)
+        .bind(row.aca_region_override)
+        .bind(row.aca_egress_allow_json)
+        .bind(row.aca_egress_traffic_inspection)
+        .bind(row.aca_auto_suspend)
         .bind(row.id)
         .bind(expected.as_str())
         .execute(&mut **transaction)
@@ -557,9 +634,17 @@ INSERT INTO environments (
     lifecycle_stop_on_terminal,
     lifecycle_auto_stop,
     labels_json,
-    env_json
+    env_json,
+    aca_region,
+    aca_resource_group,
+    aca_sandbox_group,
+    aca_disk,
+    aca_region_override,
+    aca_egress_allow_json,
+    aca_egress_traffic_inspection,
+    aca_auto_suspend
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO NOTHING
 ";
 
@@ -579,7 +664,15 @@ UPDATE environments SET
     lifecycle_stop_on_terminal = ?,
     lifecycle_auto_stop = ?,
     labels_json = ?,
-    env_json = ?
+    env_json = ?,
+    aca_region = ?,
+    aca_resource_group = ?,
+    aca_sandbox_group = ?,
+    aca_disk = ?,
+    aca_region_override = ?,
+    aca_egress_allow_json = ?,
+    aca_egress_traffic_inspection = ?,
+    aca_auto_suspend = ?
 WHERE id = ? AND revision = ?
 ";
 
@@ -600,6 +693,14 @@ struct EnvironmentSqlRow {
     lifecycle_auto_stop: Option<String>,
     labels_json: String,
     env_json: String,
+    aca_region: Option<String>,
+    aca_resource_group: Option<String>,
+    aca_sandbox_group: Option<String>,
+    aca_disk: Option<String>,
+    aca_region_override: bool,
+    aca_egress_allow_json: String,
+    aca_egress_traffic_inspection: Option<String>,
+    aca_auto_suspend: Option<String>,
 }
 
 impl EnvironmentSqlRow {
@@ -632,6 +733,23 @@ impl EnvironmentSqlRow {
                 .map(|duration| duration.to_string()),
             labels_json: encode_string_map_json("labels_json", &settings.labels)?,
             env_json: encode_env_json(&settings.env)?,
+            // ACA: inert (all default/NULL) for non-aca environments, since
+            // `settings.aca` resolves to `AcaEnvironmentSettings::default()`
+            // when no `[aca]` table was present.
+            aca_region: settings.aca.region.clone(),
+            aca_resource_group: settings.aca.resource_group.clone(),
+            aca_sandbox_group: settings.aca.sandbox_group.clone(),
+            aca_disk: settings.aca.disk.clone(),
+            aca_region_override: settings.aca.region_override,
+            aca_egress_allow_json: encode_json(
+                "aca_egress_allow_json",
+                &settings.aca.egress.allow,
+            )?,
+            aca_egress_traffic_inspection: settings.aca.egress.traffic_inspection.clone(),
+            aca_auto_suspend: settings
+                .aca
+                .auto_suspend
+                .map(|duration| duration.to_string()),
         })
     }
 }

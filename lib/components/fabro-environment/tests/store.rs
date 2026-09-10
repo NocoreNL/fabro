@@ -345,6 +345,92 @@ path = "Dockerfile"
     Ok(())
 }
 
+// ACA:
+#[tokio::test]
+async fn aca_environment_round_trips_egress_allow_list() -> anyhow::Result<()> {
+    let test = test_store(true).await?;
+    let mut settings = settings(EnvironmentProvider::Aca);
+    settings.aca.region = Some("northeurope".to_string());
+    settings.aca.resource_group = Some("rg-fabro".to_string());
+    settings.aca.sandbox_group = Some("sg-fabro".to_string());
+    settings.aca.disk = Some("ubuntu".to_string());
+    settings.aca.region_override = true;
+    settings.aca.egress.allow = vec!["*.github.com".to_string(), "api.anthropic.com".to_string()];
+    settings.aca.egress.traffic_inspection = Some("Full".to_string());
+    settings.aca.auto_suspend = Some("30m".parse()?);
+
+    let created = test
+        .store
+        .create(EnvironmentDraft {
+            id: EnvironmentId::new("aca-env").expect("valid id"),
+            settings,
+        })
+        .await?;
+
+    let reloaded = EnvironmentStore::load(test.pool.clone(), true)
+        .await?
+        .get(&created.id)
+        .expect("aca environment should reload");
+
+    assert_eq!(
+        reloaded.settings.aca.egress.allow,
+        vec!["*.github.com".to_string(), "api.anthropic.com".to_string()]
+    );
+    assert_eq!(
+        reloaded.settings.aca.sandbox_group.as_deref(),
+        Some("sg-fabro")
+    );
+    assert_eq!(reloaded.settings.aca.region.as_deref(), Some("northeurope"));
+    assert_eq!(reloaded.settings, created.settings);
+
+    Ok(())
+}
+
+// ACA:
+#[tokio::test]
+async fn automations_fk_survives_environments_rebuild() -> anyhow::Result<()> {
+    let test = test_store(true).await?;
+    let created = test
+        .store
+        .create(draft("referenced", EnvironmentProvider::Docker))
+        .await?;
+
+    sqlx::query(
+        r"
+        INSERT INTO automations (
+            id, revision, name, api_enabled, target_repository, target_branch,
+            target_workflow, environment_id
+        ) VALUES (?, ?, ?, 0, ?, ?, ?, ?)
+        ",
+    )
+    .bind("fk-test")
+    .bind("0".repeat(64))
+    .bind("fk test automation")
+    .bind("owner/repo")
+    .bind("main")
+    .bind("ci.yml")
+    .bind(created.id.as_str())
+    .execute(&test.pool)
+    .await?;
+
+    let err = test
+        .store
+        .delete(&created.id, &created.revision)
+        .await
+        .expect_err("deleting an environment referenced by automations should fail");
+    assert!(
+        matches!(err, EnvironmentStoreError::Db { .. }),
+        "expected a FK RESTRICT database error, got: {err:?}"
+    );
+    assert_eq!(
+        sql_environment_count(&test.pool).await?,
+        1,
+        "RESTRICT should block the delete, not silently no-op it"
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn legacy_import_invalid_input_leaves_source_directory_in_place() -> anyhow::Result<()> {
     assert_invalid_legacy_import_leaves_source_directory(
