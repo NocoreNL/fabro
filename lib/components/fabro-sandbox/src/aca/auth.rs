@@ -35,25 +35,47 @@ pub struct EntraTokenSource {
     audience:   String,
 }
 
+/// Which credential chain [`EntraTokenSource::new`] should build, decided by
+/// the `ACA_AUTH_MODE` env var. Kept as a pure enum (rather than branching on
+/// the raw string inline) so the selection logic is directly testable without
+/// touching process env or constructing an Azure SDK credential.
+#[derive(Debug, PartialEq)]
+enum AuthMode {
+    /// System-assigned managed identity (IMDS/App Service, no client id) —
+    /// for when this process itself runs as an Azure-hosted workload.
+    Managed,
+    /// `DeveloperToolsCredential` (Azure CLI, then Azure Developer CLI) —
+    /// for local `az login` development. The default for any value other
+    /// than `"managed"` (case-insensitive), including unset/empty.
+    Developer,
+}
+
+/// Pure mapping from the raw `ACA_AUTH_MODE` env value to an [`AuthMode`].
+/// `None` (unset) and any value other than a case-insensitive `"managed"`
+/// resolve to [`AuthMode::Developer`].
+fn auth_mode_from_env_value(value: Option<&str>) -> AuthMode {
+    match value {
+        Some(v) if v.eq_ignore_ascii_case("managed") => AuthMode::Managed,
+        _ => AuthMode::Developer,
+    }
+}
+
 impl EntraTokenSource {
     /// Builds a token source for the given audience/scope string.
     ///
     /// The audience is caller-supplied rather than hardcoded here; Task 2's
     /// capture doc (`docs/aca-data-plane-api.md`) confirms the real value.
     pub fn new(audience: impl Into<String>) -> crate::Result<Self> {
-        // ACA_AUTH_MODE=managed -> ManagedIdentityCredential (system-assigned via
-        // IMDS/App Service, no client id). Anything else (incl. unset) keeps the
-        // developer-tools credential for local `az login` dev.
-        let mode = std::env::var("ACA_AUTH_MODE").unwrap_or_default();
-        let credential: Arc<dyn TokenCredential> = if mode.eq_ignore_ascii_case("managed") {
-            ManagedIdentityCredential::new(None).map_err(|e| {
-                crate::Error::context("Failed to build Entra managed-identity credential", e)
-            })?
-        } else {
-            DeveloperToolsCredential::new(None).map_err(|e| {
-                crate::Error::context("Failed to build Entra developer-tools credential", e)
-            })?
-        };
+        let mode_value = std::env::var("ACA_AUTH_MODE").ok();
+        let credential: Arc<dyn TokenCredential> =
+            match auth_mode_from_env_value(mode_value.as_deref()) {
+                AuthMode::Managed => ManagedIdentityCredential::new(None).map_err(|e| {
+                    crate::Error::context("Failed to build Entra managed-identity credential", e)
+                })?,
+                AuthMode::Developer => DeveloperToolsCredential::new(None).map_err(|e| {
+                    crate::Error::context("Failed to build Entra developer-tools credential", e)
+                })?,
+            };
         Ok(Self {
             credential,
             audience: audience.into(),
@@ -113,13 +135,23 @@ mod tests {
     }
 
     #[test]
-    fn new_selects_credential_by_aca_auth_mode() {
-        // developer mode (default) builds a source
-        std::env::remove_var("ACA_AUTH_MODE");
-        assert!(EntraTokenSource::new("https://management.azuredevcompute.io").is_ok());
-        // managed mode builds a source too (IMDS is only hit on token(), not new())
-        std::env::set_var("ACA_AUTH_MODE", "managed");
-        assert!(EntraTokenSource::new("https://management.azuredevcompute.io").is_ok());
-        std::env::remove_var("ACA_AUTH_MODE");
+    fn auth_mode_from_env_value_selects_managed_case_insensitively() {
+        assert_eq!(auth_mode_from_env_value(Some("managed")), AuthMode::Managed);
+        assert_eq!(auth_mode_from_env_value(Some("MANAGED")), AuthMode::Managed);
+        assert_eq!(auth_mode_from_env_value(Some("Managed")), AuthMode::Managed);
+    }
+
+    #[test]
+    fn auth_mode_from_env_value_defaults_to_developer() {
+        assert_eq!(auth_mode_from_env_value(None), AuthMode::Developer);
+        assert_eq!(
+            auth_mode_from_env_value(Some("developer")),
+            AuthMode::Developer
+        );
+        assert_eq!(auth_mode_from_env_value(Some("")), AuthMode::Developer);
+        assert_eq!(
+            auth_mode_from_env_value(Some("garbage")),
+            AuthMode::Developer
+        );
     }
 }
