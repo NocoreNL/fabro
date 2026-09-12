@@ -7,12 +7,15 @@ name: ACA Image
 # This intentionally does NOT reuse release.yml: that workflow triggers on
 # v* tags, fans out to 4 compile targets (incl. macOS + 32-core runners),
 # wants SEGMENT_* secrets, and hardcodes ghcr.io/fabro-sh/fabro. None of
-# that applies here — this is a single amd64 build gated on pushes to main
-# (or manual dispatch) that publishes to ghcr.io/nocorenl/fabro.
+# that applies here — this is a single amd64 build, manually dispatched,
+# that publishes to ghcr.io/nocorenl/fabro.
+#
+# Deliberately workflow_dispatch-only (no push:[main] trigger): this is a
+# fork whose main syncs from upstream, so a push trigger would republish the
+# moving :sp2 tag on every unrelated upstream commit. Per the deploy runbook,
+# dispatch this manually after the fork PR merges.
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:
