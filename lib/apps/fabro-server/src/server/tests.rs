@@ -1405,12 +1405,36 @@ enabled = true
         "ACA_RESOURCE_GROUP",
         "ACA_SANDBOX_GROUP",
         "ACA_REGION",
+        "[server.sandbox.providers.aca] enabled = false",
     ] {
         assert!(
             message.contains(needle),
             "expected error to mention `{needle}`, got: {message}"
         );
     }
+}
+
+// R8/F6/F12/revert-fixture-hammer: `aca` now defaults to *disabled* (see
+// `fabro_config::resolve::server::resolve_sandbox`), so the shared
+// `TestAppStateBuilder` no longer needs to force it off — this test proves
+// that the default/success path builds a real `AppState` through the shared
+// builder, under `--features aca`, purely because `aca` isn't mentioned in
+// the fixture settings (and so defaults off), not because of a builder- or
+// fixture-level override.
+#[test]
+#[cfg(feature = "aca")]
+fn default_test_settings_build_app_state_with_aca_disabled_by_default() {
+    let state = TestAppStateBuilder::new().build();
+
+    assert!(
+        !state
+            .sandbox_provider_registry()
+            .providers()
+            .iter()
+            .any(|provider| provider.kind() == SandboxProviderKind::Aca),
+        "aca should default to disabled and not be present in the registry \
+         when settings don't mention it"
+    );
 }
 
 #[test]
@@ -2174,11 +2198,6 @@ methods = ["dev-token"]
 
 [server.integrations.slack]
 enabled = true
-
-# ACA: not under test here; disable explicitly so `--features aca` builds
-# don't hit the enabled-but-unconfigured startup preflight error.
-[server.sandbox.providers.aca]
-enabled = false
 "#,
         ),
         &[
@@ -2221,11 +2240,6 @@ methods = ["dev-token"]
 [server.integrations.slack]
 enabled = true
 default_channel = "#releases"
-
-# ACA: not under test here; disable explicitly so `--features aca` builds
-# don't hit the enabled-but-unconfigured startup preflight error.
-[server.sandbox.providers.aca]
-enabled = false
 "##,
         ),
         &slack_test_vault_tokens(),
@@ -2631,12 +2645,6 @@ _version = 1
 
 [server.auth]
 methods = ["dev-token"]
-
-# ACA: not under test here; disable explicitly so `--features aca` builds
-# don't hit the enabled-but-unconfigured startup preflight error before this
-# test's session-secret check runs.
-[server.sandbox.providers.aca]
-enabled = false
 "#,
     );
     let (store, artifact_store) = test_store_bundle();
@@ -7754,11 +7762,6 @@ methods = ["dev-token"]
 
 [server.integrations.github]
 strategy = "token"
-
-# ACA: not under test here; disable explicitly so `--features aca` builds
-# don't hit the enabled-but-unconfigured startup preflight error.
-[server.sandbox.providers.aca]
-enabled = false
 "#,
     )
     .expect("github token settings fixture should resolve")
