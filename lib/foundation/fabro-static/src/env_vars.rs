@@ -113,6 +113,10 @@ impl EnvVars {
     pub const ACA_RESOURCE_GROUP: &'static str = "ACA_RESOURCE_GROUP";
     pub const ACA_SANDBOX_GROUP: &'static str = "ACA_SANDBOX_GROUP";
     pub const ACA_REGION: &'static str = "ACA_REGION";
+    // ACA: selects the Entra credential chain `EntraTokenSource::new` builds
+    // (see `fabro-sandbox/src/aca/auth.rs`); sibling of the four account vars
+    // above but not part of `AcaAccount` scoping, so kept as its own const.
+    pub const ACA_AUTH_MODE: &'static str = "ACA_AUTH_MODE";
     pub const DAYTONA_API_KEY: &'static str = "DAYTONA_API_KEY";
     pub const DAYTONA_API_URL: &'static str = "DAYTONA_API_URL";
     pub const DAYTONA_ORGANIZATION_ID: &'static str = "DAYTONA_ORGANIZATION_ID";
@@ -261,6 +265,7 @@ mod tests {
             EnvVars::ACA_RESOURCE_GROUP,
             EnvVars::ACA_SANDBOX_GROUP,
             EnvVars::ACA_REGION,
+            EnvVars::ACA_AUTH_MODE,
             EnvVars::DAYTONA_API_KEY,
             EnvVars::DAYTONA_API_URL,
             EnvVars::DAYTONA_ORGANIZATION_ID,

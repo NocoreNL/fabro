@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use azure_core::credentials::TokenCredential;
 use azure_identity::{DeveloperToolsCredential, ManagedIdentityCredential};
+use fabro_static::EnvVars;
 
 /// Yields a bearer token for the ACA data-plane audience.
 ///
@@ -66,7 +67,26 @@ impl EntraTokenSource {
     /// The audience is caller-supplied rather than hardcoded here; Task 2's
     /// capture doc (`docs/aca-data-plane-api.md`) confirms the real value.
     pub fn new(audience: impl Into<String>) -> crate::Result<Self> {
-        let mode_value = std::env::var("ACA_AUTH_MODE").ok();
+        // `EntraTokenSource::new` is called both from the server's
+        // `build_sandbox_provider_registry` (which has an injected
+        // `EnvLookup` in scope) and from `sandbox_spec.rs`'s standalone
+        // `SandboxSpec::Aca::build` path (which has none — it falls back to
+        // process env directly via `aca_account_from_process_env`, see
+        // `provider/aca.rs`). `EnvLookup` itself is `pub(crate)` to
+        // `fabro-server`, a crate that depends on `fabro-sandbox` (not the
+        // other way around), so it can't be named here at all; threading an
+        // equivalent closure through `new`'s signature would only reach one
+        // of its two call sites and leave the other unchanged. This mirrors
+        // `aca_account_from_process_env`'s own documented facade for the
+        // sibling ACA_* account vars.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "process-env lookup facade for the ACA auth-mode toggle; EnvLookup isn't \
+                      reachable here (see comment above), so this reads the registered \
+                      EnvVars::ACA_AUTH_MODE name directly, mirroring \
+                      aca_account_from_process_env's facade for the sibling ACA_* vars"
+        )]
+        let mode_value = std::env::var(EnvVars::ACA_AUTH_MODE).ok();
         let credential: Arc<dyn TokenCredential> =
             match auth_mode_from_env_value(mode_value.as_deref()) {
                 AuthMode::Managed => ManagedIdentityCredential::new(None).map_err(|e| {
