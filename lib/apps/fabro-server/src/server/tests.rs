@@ -1376,6 +1376,68 @@ enabled = false
 }
 
 #[test]
+#[cfg(feature = "aca")]
+fn aca_enabled_without_account_env_is_a_hard_startup_error() {
+    let settings = server_settings_from_toml(
+        r#"
+_version = 1
+
+[server.auth]
+methods = ["dev-token"]
+
+[server.sandbox.providers.aca]
+enabled = true
+"#,
+    );
+    // A deliberately empty lookup (rather than the process env) so this test
+    // cannot depend on — or be broken by — ACA_* vars that happen to be set
+    // in the ambient process environment.
+    let no_env: EnvLookup = Arc::new(|_: &str| None);
+
+    let Err(err) = build_sandbox_provider_registry(&settings, None, &no_env, None) else {
+        panic!("aca enabled without ACA_* account env should be a hard startup error");
+    };
+
+    let message = err.to_string();
+    for needle in [
+        "aca",
+        "ACA_SUBSCRIPTION_ID",
+        "ACA_RESOURCE_GROUP",
+        "ACA_SANDBOX_GROUP",
+        "ACA_REGION",
+        "[server.sandbox.providers.aca] enabled = false",
+    ] {
+        assert!(
+            message.contains(needle),
+            "expected error to mention `{needle}`, got: {message}"
+        );
+    }
+}
+
+// R8/F6/F12/revert-fixture-hammer: `aca` now defaults to *disabled* (see
+// `fabro_config::resolve::server::resolve_sandbox`), so the shared
+// `TestAppStateBuilder` no longer needs to force it off — this test proves
+// that the default/success path builds a real `AppState` through the shared
+// builder, under `--features aca`, purely because `aca` isn't mentioned in
+// the fixture settings (and so defaults off), not because of a builder- or
+// fixture-level override.
+#[test]
+#[cfg(feature = "aca")]
+fn default_test_settings_build_app_state_with_aca_disabled_by_default() {
+    let state = TestAppStateBuilder::new().build();
+
+    assert!(
+        !state
+            .sandbox_provider_registry()
+            .providers()
+            .iter()
+            .any(|provider| provider.kind() == SandboxProviderKind::Aca),
+        "aca should default to disabled and not be present in the registry \
+         when settings don't mention it"
+    );
+}
+
+#[test]
 fn clone_sandbox_credentials_are_available_for_clone_based_providers() {
     use fabro_types::settings::run::EnvironmentProvider;
     assert!(EnvironmentProvider::Docker.is_clone_based());

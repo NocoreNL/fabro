@@ -195,7 +195,7 @@ default_channel = "{{ env.SLACK_DEFAULT_CHANNEL }}"
 }
 
 #[test]
-fn server_sandbox_defaults_all_providers_enabled() {
+fn server_sandbox_defaults_local_docker_daytona_enabled_aca_disabled() {
     let settings = ServerSettingsBuilder::from_toml(
         r#"
 _version = 1
@@ -210,6 +210,10 @@ methods = ["dev-token"]
     assert!(sandbox.providers.local.enabled);
     assert!(sandbox.providers.docker.enabled);
     assert!(sandbox.providers.daytona.enabled);
+    // ACA is the one built-in provider that defaults to *disabled* — an
+    // enabled-but-unconfigured `aca` is a hard startup error, so it must
+    // never turn on unless a deployment opts in explicitly (R8/F6/F12).
+    assert!(!sandbox.providers.aca.enabled);
 }
 
 #[test]
@@ -231,6 +235,48 @@ enabled = false
     assert!(sandbox.providers.local.enabled);
     assert!(sandbox.providers.docker.enabled);
     assert!(!sandbox.providers.daytona.enabled);
+}
+
+#[test]
+fn server_sandbox_aca_can_be_explicitly_enabled() {
+    let settings = ServerSettingsBuilder::from_toml(
+        r#"
+_version = 1
+
+[server.auth]
+methods = ["dev-token"]
+
+[server.sandbox.providers.aca]
+enabled = true
+"#,
+    )
+    .expect("server settings should resolve");
+
+    let sandbox = settings.server.sandbox;
+    assert!(sandbox.providers.aca.enabled);
+    // Explicitly enabling `aca` must not disturb the other providers' own
+    // (enabled-by-default) resolution.
+    assert!(sandbox.providers.local.enabled);
+    assert!(sandbox.providers.docker.enabled);
+    assert!(sandbox.providers.daytona.enabled);
+}
+
+#[test]
+fn server_sandbox_aca_can_be_explicitly_disabled() {
+    let settings = ServerSettingsBuilder::from_toml(
+        r#"
+_version = 1
+
+[server.auth]
+methods = ["dev-token"]
+
+[server.sandbox.providers.aca]
+enabled = false
+"#,
+    )
+    .expect("server settings should resolve");
+
+    assert!(!settings.server.sandbox.providers.aca.enabled);
 }
 
 #[test]

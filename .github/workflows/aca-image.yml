@@ -1,0 +1,123 @@
+name: ACA Image
+
+# Purpose-built image build for the SP2 Azure deployment: an amd64,
+# --features aca, web-UI-included Fabro image published to GHCR under the
+# NocoreNL fork's own namespace.
+#
+# This intentionally does NOT reuse release.yml: that workflow triggers on
+# v* tags, fans out to 4 compile targets (incl. macOS + 32-core runners),
+# wants SEGMENT_* secrets, and hardcodes ghcr.io/fabro-sh/fabro. None of
+# that applies here — this is a single amd64 build, manually dispatched,
+# that publishes to ghcr.io/nocorenl/fabro.
+#
+# Deliberately workflow_dispatch-only (no push:[main] trigger): this is a
+# fork whose main syncs from upstream, so a push trigger would republish the
+# moving :sp2 tag on every unrelated upstream commit. Per the deploy runbook,
+# dispatch this manually after the fork PR merges.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # cargo-zigbuild links libz-sys (pulled in transitively via git2) against
+  # musl; without this it fails to find/link a static libz for the musl
+  # target. Same fix release.yml uses for its musl matrix legs, and the same
+  # env var `cargo dev docker-build` injects for its zigbuild invocation.
+  LIBZ_SYS_STATIC: "1"
+
+jobs:
+  build-and-push:
+    name: Build & push (linux/amd64, aca)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.97.1
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-on-failure: true
+
+      - name: Set up zig
+        uses: mlugg/setup-zig@8d6198c65fb0feaa111df26e6b467fea8345e46f # v2.0.5
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@773334c0e05d7e699e4d78234494308223f3a2cf # v2
+        with:
+          tool: cargo-zigbuild
+
+      # `cargo dev spa refresh` shells out to `bun run build` in
+      # apps/fabro-web (see spa_refresh.rs), so bun + its deps must be
+      # installed first. Same pinned setup-bun version + bun install
+      # release.yml and nightly.yml use ahead of this command.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+          no-cache: true
+
+      - name: Install bun deps
+        run: bun install --frozen-lockfile
+
+      # The web UI is rust-embed'd from mirrored SPA assets that are
+      # .gitkeep-only in git. Without this step the binary ships with no
+      # web UI.
+      - name: Refresh embedded SPA assets
+        run: cargo --locked dev spa refresh
+
+      - name: Build fabro-cli (musl, aca feature)
+        run: cargo zigbuild --locked --target x86_64-unknown-linux-musl --release -p fabro-cli --features aca
+
+      # Matches the Dockerfile's expected build context layout:
+      #   tmp/docker-context/amd64/fabro
+      - name: Stage binary for Docker build context
+        run: |
+          mkdir -p tmp/docker-context/amd64
+          cp target/x86_64-unknown-linux-musl/release/fabro tmp/docker-context/amd64/fabro
+
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build amd64 image for smoke test
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: fabro-aca-smoke:amd64
+
+      - name: Smoke-test image
+        run: docker run --rm --platform linux/amd64 fabro-aca-smoke:amd64 fabro version
+
+      - name: Build and push
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/nocorenl/fabro:${{ github.sha }}
+            ghcr.io/nocorenl/fabro:sp2

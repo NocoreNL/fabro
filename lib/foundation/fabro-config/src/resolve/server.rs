@@ -72,16 +72,28 @@ fn resolve_sandbox(layer: Option<&ServerSandboxLayer>) -> ServerSandboxSettings 
         providers: ServerSandboxProvidersSettings {
             local:   resolve_sandbox_provider(
                 providers.and_then(|providers| providers.local.as_ref()),
+                true,
             ),
             docker:  resolve_sandbox_provider(
                 providers.and_then(|providers| providers.docker.as_ref()),
+                true,
             ),
             daytona: resolve_sandbox_provider(
                 providers.and_then(|providers| providers.daytona.as_ref()),
+                true,
             ),
-            // ACA:
+            // ACA: unlike the other built-in providers, `aca` defaults to
+            // *disabled*. An enabled-but-unconfigured `aca` is a hard
+            // startup error (see `build_sandbox_provider_registry` in
+            // fabro-server), so defaulting it on would break every
+            // deployment that isn't running on Azure Container Apps out of
+            // the box — including the `--features aca` image, which is
+            // shipped to everyone regardless of where they deploy it.
+            // Deployments that want ACA must opt in explicitly via
+            // `[server.sandbox.providers.aca] enabled = true`.
             aca:     resolve_sandbox_provider(
                 providers.and_then(|providers| providers.aca.as_ref()),
+                false,
             ),
         },
     }
@@ -89,9 +101,12 @@ fn resolve_sandbox(layer: Option<&ServerSandboxLayer>) -> ServerSandboxSettings 
 
 fn resolve_sandbox_provider(
     layer: Option<&ServerSandboxProviderLayer>,
+    default_enabled: bool,
 ) -> ServerSandboxProviderSettings {
     ServerSandboxProviderSettings {
-        enabled: layer.and_then(|provider| provider.enabled).unwrap_or(true),
+        enabled: layer
+            .and_then(|provider| provider.enabled)
+            .unwrap_or(default_enabled),
     }
 }
 

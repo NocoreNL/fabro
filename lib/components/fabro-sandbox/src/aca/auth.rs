@@ -5,7 +5,8 @@
 use std::sync::Arc;
 
 use azure_core::credentials::TokenCredential;
-use azure_identity::DeveloperToolsCredential;
+use azure_identity::{DeveloperToolsCredential, ManagedIdentityCredential};
+use fabro_static::EnvVars;
 
 /// Yields a bearer token for the ACA data-plane audience.
 ///
@@ -17,19 +18,47 @@ pub trait TokenSource: Send + Sync {
     async fn token(&self) -> crate::Result<String>;
 }
 
-/// Production [`TokenSource`] backed by `azure_identity`'s developer-tools
-/// credential chain (Azure CLI, then Azure Developer CLI).
+/// Production [`TokenSource`] backed by `azure_identity`, selecting between
+/// two credential chains via the `ACA_AUTH_MODE` env var:
 ///
-/// `azure_identity` 1.x removed `DefaultAzureCredential` in favor of
+/// - `ACA_AUTH_MODE=managed` — [`ManagedIdentityCredential`] (system-assigned,
+///   via IMDS/App Service, no client id). Use this when the process itself
+///   runs as an Azure-hosted workload (e.g. the Fabro server on an Azure VM)
+///   and must authenticate to the ACA data plane as that VM's identity.
+/// - anything else, including unset — [`DeveloperToolsCredential`] (Azure
+///   CLI, then Azure Developer CLI), for local `az login` development.
+///
+/// `azure_identity` 1.x removed `DefaultAzureCredential` in favor of these
 /// audience-specific credential types (see the crate's CHANGELOG: "Replaced
-/// `DefaultAzureCredential` with `DeveloperToolsCredential`"). This picks
-/// `DeveloperToolsCredential` as the closest equivalent available today.
-/// It does not include `ManagedIdentityCredential`, so it won't authenticate
-/// when this process itself runs as an Azure-hosted workload — revisit once
-/// the deployment model for the ACA data-plane client is settled.
+/// `DefaultAzureCredential` with `DeveloperToolsCredential`").
 pub struct EntraTokenSource {
-    credential: Arc<DeveloperToolsCredential>,
+    credential: Arc<dyn TokenCredential>,
     audience:   String,
+}
+
+/// Which credential chain [`EntraTokenSource::new`] should build, decided by
+/// the `ACA_AUTH_MODE` env var. Kept as a pure enum (rather than branching on
+/// the raw string inline) so the selection logic is directly testable without
+/// touching process env or constructing an Azure SDK credential.
+#[derive(Debug, PartialEq)]
+enum AuthMode {
+    /// System-assigned managed identity (IMDS/App Service, no client id) —
+    /// for when this process itself runs as an Azure-hosted workload.
+    Managed,
+    /// `DeveloperToolsCredential` (Azure CLI, then Azure Developer CLI) —
+    /// for local `az login` development. The default for any value other
+    /// than `"managed"` (case-insensitive), including unset/empty.
+    Developer,
+}
+
+/// Pure mapping from the raw `ACA_AUTH_MODE` env value to an [`AuthMode`].
+/// `None` (unset) and any value other than a case-insensitive `"managed"`
+/// resolve to [`AuthMode::Developer`].
+fn auth_mode_from_env_value(value: Option<&str>) -> AuthMode {
+    match value {
+        Some(v) if v.eq_ignore_ascii_case("managed") => AuthMode::Managed,
+        _ => AuthMode::Developer,
+    }
 }
 
 impl EntraTokenSource {
@@ -38,9 +67,35 @@ impl EntraTokenSource {
     /// The audience is caller-supplied rather than hardcoded here; Task 2's
     /// capture doc (`docs/aca-data-plane-api.md`) confirms the real value.
     pub fn new(audience: impl Into<String>) -> crate::Result<Self> {
-        let credential = DeveloperToolsCredential::new(None).map_err(|e| {
-            crate::Error::context("Failed to build Entra developer-tools credential", e)
-        })?;
+        // `EntraTokenSource::new` is called both from the server's
+        // `build_sandbox_provider_registry` (which has an injected
+        // `EnvLookup` in scope) and from `sandbox_spec.rs`'s standalone
+        // `SandboxSpec::Aca::build` path (which has none — it falls back to
+        // process env directly via `aca_account_from_process_env`, see
+        // `provider/aca.rs`). `EnvLookup` itself is `pub(crate)` to
+        // `fabro-server`, a crate that depends on `fabro-sandbox` (not the
+        // other way around), so it can't be named here at all; threading an
+        // equivalent closure through `new`'s signature would only reach one
+        // of its two call sites and leave the other unchanged. This mirrors
+        // `aca_account_from_process_env`'s own documented facade for the
+        // sibling ACA_* account vars.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "process-env lookup facade for the ACA auth-mode toggle; EnvLookup isn't \
+                      reachable here (see comment above), so this reads the registered \
+                      EnvVars::ACA_AUTH_MODE name directly, mirroring \
+                      aca_account_from_process_env's facade for the sibling ACA_* vars"
+        )]
+        let mode_value = std::env::var(EnvVars::ACA_AUTH_MODE).ok();
+        let credential: Arc<dyn TokenCredential> =
+            match auth_mode_from_env_value(mode_value.as_deref()) {
+                AuthMode::Managed => ManagedIdentityCredential::new(None).map_err(|e| {
+                    crate::Error::context("Failed to build Entra managed-identity credential", e)
+                })?,
+                AuthMode::Developer => DeveloperToolsCredential::new(None).map_err(|e| {
+                    crate::Error::context("Failed to build Entra developer-tools credential", e)
+                })?,
+            };
         Ok(Self {
             credential,
             audience: audience.into(),
@@ -97,5 +152,26 @@ mod tests {
     async fn fake_token_source_returns_token() {
         let ts = FakeTokenSource("test-token".to_string());
         assert_eq!(ts.token().await.unwrap(), "test-token");
+    }
+
+    #[test]
+    fn auth_mode_from_env_value_selects_managed_case_insensitively() {
+        assert_eq!(auth_mode_from_env_value(Some("managed")), AuthMode::Managed);
+        assert_eq!(auth_mode_from_env_value(Some("MANAGED")), AuthMode::Managed);
+        assert_eq!(auth_mode_from_env_value(Some("Managed")), AuthMode::Managed);
+    }
+
+    #[test]
+    fn auth_mode_from_env_value_defaults_to_developer() {
+        assert_eq!(auth_mode_from_env_value(None), AuthMode::Developer);
+        assert_eq!(
+            auth_mode_from_env_value(Some("developer")),
+            AuthMode::Developer
+        );
+        assert_eq!(auth_mode_from_env_value(Some("")), AuthMode::Developer);
+        assert_eq!(
+            auth_mode_from_env_value(Some("garbage")),
+            AuthMode::Developer
+        );
     }
 }

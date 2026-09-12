@@ -2381,7 +2381,7 @@ fn build_sandbox_provider_registry(
     daytona_api_key: Option<String>,
     env_lookup: &EnvLookup,
     http_client: Option<fabro_http::HttpClient>,
-) -> SandboxProviderRegistry {
+) -> anyhow::Result<SandboxProviderRegistry> {
     let provider_settings = &server_settings.server.sandbox.providers;
     let mut providers: Vec<Arc<dyn SandboxProvider>> = Vec::new();
     // ACA: cloned up front, before Daytona's block below moves `http_client`
@@ -2409,37 +2409,47 @@ fn build_sandbox_provider_registry(
         )));
     }
 
-    // ACA:
+    // ACA: an enabled-but-unbuildable `aca` provider is a hard startup
+    // preflight failure — not a silent warn-and-drop — for ANY reason it
+    // fails to build: missing ACA_* account env, a failing Entra credential,
+    // or a failing HTTP client. This used to boot "healthy" with a silently
+    // missing `aca` provider and fail later with an unrelated-looking error
+    // (SP2 spec DoD #5 / R8 follow-up F8). Every failure names the exact
+    // off-switch so an operator who didn't intend to run ACA on this
+    // instance has an immediate, precise fix.
     #[cfg(feature = "aca")]
     if provider_settings.aca.enabled {
-        if let Some(account) = aca_account_from_env(env_lookup) {
-            match aca_http_client(aca_http_client_source) {
-                Ok(http) => match EntraTokenSource::new(ACA_TOKEN_AUDIENCE) {
-                    Ok(token_source) => {
-                        providers.push(Arc::new(AcaSandboxProvider::new(
-                            Arc::new(token_source),
-                            http,
-                            account,
-                        )));
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "failed to build Entra token source; ACA sandbox provider disabled"
-                        );
-                    }
-                },
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "failed to build HTTP client; ACA sandbox provider disabled"
-                    );
-                }
-            }
-        }
+        const ACA_OFF_SWITCH: &str = "[server.sandbox.providers.aca] enabled = false";
+
+        let account = aca_account_from_env(env_lookup).ok_or_else(|| {
+            anyhow::anyhow!(
+                "sandbox provider `aca` is enabled but ACA_SUBSCRIPTION_ID/\
+                 ACA_RESOURCE_GROUP/ACA_SANDBOX_GROUP/ACA_REGION are not all set; set them, or \
+                 disable the provider with {ACA_OFF_SWITCH}"
+            )
+        })?;
+        let http = aca_http_client(aca_http_client_source).map_err(|err| {
+            anyhow::anyhow!(
+                "sandbox provider `aca` is enabled but its HTTP client failed to build: {err}; \
+                 disable the provider with {ACA_OFF_SWITCH} if this instance isn't meant to run \
+                 ACA"
+            )
+        })?;
+        let token_source = EntraTokenSource::new(ACA_TOKEN_AUDIENCE).map_err(|err| {
+            anyhow::anyhow!(
+                "sandbox provider `aca` is enabled but its Entra credential failed to build: \
+                 {err}; disable the provider with {ACA_OFF_SWITCH} if this instance isn't meant \
+                 to run ACA"
+            )
+        })?;
+        providers.push(Arc::new(AcaSandboxProvider::new(
+            Arc::new(token_source),
+            http,
+            account,
+        )));
     }
 
-    SandboxProviderRegistry::new(providers)
+    Ok(SandboxProviderRegistry::new(providers))
 }
 
 pub(crate) fn automation_dir_for_active_config(active_config_path: &std::path::Path) -> PathBuf {
@@ -2502,6 +2512,30 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         automation_materializer_override,
     } = config;
 
+    let vault = preloaded_vault;
+    // Read vault secrets needed for synchronous setup before we wrap the vault in
+    // an async lock for the rest of AppState.
+    let daytona_api_key = vault.get(EnvVars::DAYTONA_API_KEY).map(str::to_string);
+    let current_server_settings = Arc::new(resolved_settings.server_settings);
+    // Sandbox-provider preflight: validated (and, when no override is
+    // supplied, built) BEFORE the automation-environment migration below, so
+    // a misconfigured `aca` (enabled but unbuildable) aborts startup before
+    // any `automations` row is rewritten, rather than after (R8/F7 — a real
+    // preflight, not a late-firing check that leaves the DB already
+    // mutated). Every input this needs — settings, the vault-derived Daytona
+    // key, `env_lookup`, `http_client` — is already available straight out
+    // of `AppStateConfig`, so this doesn't need anything the migration or
+    // the stores built below would otherwise provide first.
+    let sandbox_provider_registry = match sandbox_provider_registry {
+        Some(registry) => registry,
+        None => build_sandbox_provider_registry(
+            current_server_settings.as_ref(),
+            daytona_api_key,
+            &env_lookup,
+            http_client.clone(),
+        )?,
+    };
+
     let automation_migration_pool = db_pool.clone();
     load_store_blocking("automation environment migration", move || async move {
         fabro_automation::backfill_environment_selectors(&automation_migration_pool)
@@ -2510,13 +2544,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
     })
     .context("backfill automation environment selectors")?;
     let automation_store = Arc::new(AutomationStore::new(db_pool.clone()));
-    let local_provider_enabled = resolved_settings
-        .server_settings
-        .server
-        .sandbox
-        .providers
-        .local
-        .enabled;
+    let local_provider_enabled = current_server_settings.server.sandbox.providers.local.enabled;
     let environment_pool = db_pool.clone();
     let environment_store = Arc::new(
         load_store_blocking("environment store", move || async move {
@@ -2541,15 +2569,10 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
     );
     let variables = Arc::new(VariableStore::new(db_pool.clone()));
     let secret_store = Arc::new(SecretStore::new(db_pool));
-    let vault = preloaded_vault;
-    // Read vault secrets needed for synchronous setup before we wrap the vault in
-    // an async lock for the rest of AppState.
-    let daytona_api_key = vault.get(EnvVars::DAYTONA_API_KEY).map(str::to_string);
     let llm_source: Arc<dyn CredentialSource> = Arc::new(SqlVaultCredentialSource::vault_only(
         Arc::clone(&secret_store),
     ));
     let (global_event_tx, _) = broadcast::channel(4096);
-    let current_server_settings = Arc::new(resolved_settings.server_settings);
     let current_effective_web_url =
         effective_web_url(&current_server_settings.server, |name| env_lookup(name));
     let current_manifest_run_defaults = Arc::new(resolved_settings.manifest_run_defaults);
@@ -2562,14 +2585,6 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         Catalog::from_builtin_with_overrides(&resolved_settings.llm_catalog_settings)
             .context("building LLM model catalog")?,
     );
-    let sandbox_provider_registry = sandbox_provider_registry.unwrap_or_else(|| {
-        build_sandbox_provider_registry(
-            current_server_settings.as_ref(),
-            daytona_api_key,
-            &env_lookup,
-            http_client.clone(),
-        )
-    });
     let slack_service = {
         let slack_settings = &current_server_settings.server.integrations.slack;
         if slack_settings.enabled {
