@@ -980,9 +980,8 @@ fn preflight_sandbox_spec(
             }
         }
         // ACA: preflight never requests a pinned tag/commit (both hard-coded
-        // `None` in the Docker/Daytona arms above too), so unlike
-        // `start.rs`'s `RunSession::new` there is no pin request to reject
-        // here.
+        // `None` in the Docker/Daytona arms above too) — the pinned checkout
+        // path only runs for real runs via `start.rs`'s `RunSession::new`.
         SandboxProviderKind::Aca => {
             #[cfg(feature = "aca")]
             {
@@ -993,6 +992,8 @@ fn preflight_sandbox_spec(
                     run_id: None,
                     clone_origin_url,
                     clone_branch,
+                    clone_tag: None,
+                    clone_commit_sha: None,
                 }
             }
             #[cfg(not(feature = "aca"))]
