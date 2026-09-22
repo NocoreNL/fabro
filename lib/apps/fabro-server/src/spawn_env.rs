@@ -50,6 +50,20 @@ const WORKER_ENV_ALLOWLIST: &[&str] = &[
     EnvVars::AWS_CONTAINER_CREDENTIALS_RELATIVE_URI,
     EnvVars::AWS_CONTAINER_CREDENTIALS_FULL_URI,
     EnvVars::AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE,
+    // ACA sandbox account + auth-mode selectors. The worker builds the ACA
+    // sandbox through `SandboxSpec::Aca::build`, whose standalone
+    // `aca_account_from_process_env` reads these four account vars directly
+    // from process env (it has no `EnvLookup`/vault plumbing threaded down —
+    // see `fabro-sandbox`'s `provider/aca.rs`), and the token source reads
+    // `ACA_AUTH_MODE` to pick managed-identity vs developer credentials (see
+    // `aca/auth.rs`). All five are non-secret resource/mode selectors, so like
+    // the AWS chain inputs above they must survive `env_clear()` into the
+    // worker rather than being read only in the server process.
+    EnvVars::ACA_SUBSCRIPTION_ID,
+    EnvVars::ACA_RESOURCE_GROUP,
+    EnvVars::ACA_SANDBOX_GROUP,
+    EnvVars::ACA_REGION,
+    EnvVars::ACA_AUTH_MODE,
 ];
 
 const RENDER_GRAPH_ENV_ALLOWLIST: &[&str] = &[EnvVars::PATH, EnvVars::HOME, EnvVars::TMPDIR];
@@ -135,6 +149,14 @@ mod tests {
             ("AWS_BEARER_TOKEN_BEDROCK".to_string(), "bearer".to_string()),
             ("BEDROCK_API_KEY".to_string(), "alias-bearer".to_string()),
             ("AWS_REGION".to_string(), "us-east-2".to_string()),
+            (
+                "ACA_SUBSCRIPTION_ID".to_string(),
+                "00000000-0000-0000-0000-000000000000".to_string(),
+            ),
+            ("ACA_RESOURCE_GROUP".to_string(), "rg-1".to_string()),
+            ("ACA_SANDBOX_GROUP".to_string(), "sg-1".to_string()),
+            ("ACA_REGION".to_string(), "northeurope".to_string()),
+            ("ACA_AUTH_MODE".to_string(), "managed".to_string()),
             ("SESSION_SECRET".to_string(), "leak".to_string()),
             ("FABRO_JWT_PRIVATE_KEY".to_string(), "leak".to_string()),
             ("FABRO_JWT_PUBLIC_KEY".to_string(), "leak".to_string()),
@@ -198,6 +220,28 @@ mod tests {
         assert_eq!(
             actual.get("AWS_REGION").map(String::as_str),
             Some("us-east-2")
+        );
+        // ACA account + auth-mode selectors cross into the worker so its
+        // standalone `SandboxSpec::Aca::build` can read them from process env.
+        assert_eq!(
+            actual.get("ACA_SUBSCRIPTION_ID").map(String::as_str),
+            Some("00000000-0000-0000-0000-000000000000")
+        );
+        assert_eq!(
+            actual.get("ACA_RESOURCE_GROUP").map(String::as_str),
+            Some("rg-1")
+        );
+        assert_eq!(
+            actual.get("ACA_SANDBOX_GROUP").map(String::as_str),
+            Some("sg-1")
+        );
+        assert_eq!(
+            actual.get("ACA_REGION").map(String::as_str),
+            Some("northeurope")
+        );
+        assert_eq!(
+            actual.get("ACA_AUTH_MODE").map(String::as_str),
+            Some("managed")
         );
         assert!(!actual.contains_key("AWS_BEARER_TOKEN_BEDROCK"));
         assert!(!actual.contains_key("BEDROCK_API_KEY"));
