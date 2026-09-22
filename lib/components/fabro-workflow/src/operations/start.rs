@@ -531,26 +531,18 @@ impl RunSession {
                     api_key,
                 }
             }
-            // ACA: workflow execution wiring. Unlike Docker/Daytona, this
-            // rejects a pinned tag/commit request outright rather than
-            // threading `clone_source.tag`/`clone_source.commit_sha`
-            // through: `SandboxSpec::Aca` (mirroring `SandboxCreateSpec::Aca`,
-            // T4) has no field for either, because an ACA sandbox clones the
-            // repo at initialize() but does not support tag/commit pinning —
-            // see that variant's doc comment in `sandbox_spec.rs`. Silently
-            // dropping the pin instead would run the caller's request against
-            // whatever branch was just cloned, with no indication that the
-            // pin was never honored.
+            // ACA: workflow execution wiring, mirroring Docker/Daytona — the
+            // pinned `clone_source.tag`/`clone_source.commit_sha` thread
+            // straight through to `SandboxSpec::Aca`, which `AcaSandbox`
+            // honors by fetching and checking out that exact revision after
+            // the branch clone (see `aca/sandbox.rs`'s `clone_if_configured`).
+            // Both `fabro run` (pins the local HEAD commit) and automations
+            // (resolve a branch to its exact commit) hand this provider a
+            // pinned revision, so dropping it would silently run against
+            // whatever the branch pointed at instead.
             SandboxProviderKind::Aca => {
                 #[cfg(feature = "aca")]
                 {
-                    if clone_source.tag.is_some() || clone_source.commit_sha.is_some() {
-                        return Err(Error::engine(
-                            "the Aca sandbox provider does not support pinned tag/commit \
-                             checkout; its sandboxes always start from their pre-baked disk \
-                             image",
-                        ));
-                    }
                     let config = resolve_aca_config(resolved);
                     SandboxSpec::Aca {
                         config: Box::new(config),
@@ -558,6 +550,8 @@ impl RunSession {
                         run_id: Some(record.run_id),
                         clone_origin_url: clone_source.origin_url,
                         clone_branch: clone_source.branch,
+                        clone_tag: clone_source.tag,
+                        clone_commit_sha: clone_source.commit_sha,
                     }
                 }
                 #[cfg(not(feature = "aca"))]

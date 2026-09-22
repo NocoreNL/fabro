@@ -13,6 +13,11 @@ pub(crate) enum CloneDecision {
     },
 }
 
+// The owner/repo checkout layout is Docker/Daytona-only; ACA reuses this
+// module for `decide_clone` and the pinned-revision helpers but has a single
+// flat working directory, so gate the layout out of aca-only builds (`test`
+// keeps this module's own unit tests compiling).
+#[cfg(any(feature = "docker", feature = "daytona", test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GitHubRepoLayout {
     pub(crate) owner:               String,
@@ -23,6 +28,7 @@ pub(crate) struct GitHubRepoLayout {
     pub(crate) execution_directory: String,
 }
 
+#[cfg(any(feature = "docker", feature = "daytona", test))]
 pub(crate) fn github_repo_layout(
     origin_url: &str,
     workspace_root: &str,
@@ -52,6 +58,7 @@ pub(crate) fn github_repo_layout(
     })
 }
 
+#[cfg(any(feature = "docker", feature = "daytona", test))]
 fn validate_path_component(label: &str, component: &str) -> crate::Result<()> {
     let is_safe = !matches!(component, "." | "..")
         && component
@@ -65,6 +72,7 @@ fn validate_path_component(label: &str, component: &str) -> crate::Result<()> {
     Ok(())
 }
 
+#[cfg(any(feature = "docker", feature = "daytona", test))]
 pub(crate) fn repo_symlink_command(layout: &GitHubRepoLayout) -> String {
     format!(
         "ln -s {} {}",
@@ -73,7 +81,7 @@ pub(crate) fn repo_symlink_command(layout: &GitHubRepoLayout) -> String {
     )
 }
 
-#[cfg(any(feature = "docker", test))]
+#[cfg(any(feature = "docker", feature = "aca", test))]
 pub(crate) fn exact_repository_init_command(clone_url: &str, checkout_path: &str) -> String {
     format!(
         "{git} init -- {path} && git -C {path} remote add origin {origin}",
@@ -159,7 +167,7 @@ pub(crate) fn tag_ref(tag: &str) -> String {
 ///
 /// The fetch names the revision directly rather than the branch, and
 /// `--no-tags` keeps unrelated tags from being pulled alongside it.
-#[cfg(any(feature = "docker", test))]
+#[cfg(any(feature = "docker", feature = "aca", test))]
 pub(crate) fn pinned_fetch_command(
     checkout_path: &str,
     fetch_source: &str,
@@ -178,7 +186,7 @@ pub(crate) fn pinned_fetch_command(
 
 /// Leading-space ` --depth N` fragment for a Git command, or empty when
 /// `depth` is `None` to fetch full history.
-#[cfg(any(feature = "docker", test))]
+#[cfg(any(feature = "docker", feature = "aca", test))]
 pub(crate) fn depth_argument(depth: Option<usize>) -> String {
     depth.map_or_else(String::new, |depth| format!(" --depth {depth}"))
 }
@@ -215,7 +223,7 @@ pub(crate) fn exact_head_revision_command(checkout_path: &str) -> String {
 /// Check out the admitted branch and print the resulting HEAD in one shell
 /// command; stdout is the `rev-parse HEAD` output for
 /// [`PinnedRevision::verify_head`].
-#[cfg(any(feature = "docker", test))]
+#[cfg(any(feature = "docker", feature = "aca", test))]
 pub(crate) fn exact_checkout_verify_command(
     checkout_path: &str,
     branch: &str,
@@ -230,7 +238,7 @@ pub(crate) fn exact_checkout_verify_command(
 
 /// The peeled commit behind whatever `git fetch` just wrote to `FETCH_HEAD`;
 /// a commit peels to itself, an annotated tag to the commit it points at.
-#[cfg(any(feature = "docker", test))]
+#[cfg(any(feature = "docker", feature = "aca", test))]
 pub(crate) const FETCH_HEAD_COMMIT: &str = "FETCH_HEAD^{commit}";
 
 /// Validate that a `rev-parse HEAD` output is a single commit ID and return it
@@ -241,6 +249,7 @@ pub(crate) fn verify_resolved_head(output: &str) -> crate::Result<String> {
     })
 }
 
+#[cfg(any(feature = "docker", feature = "daytona", test))]
 fn trim_root(root: &str) -> &str {
     let trimmed = root.trim_end_matches('/');
     if trimmed.is_empty() { "/" } else { trimmed }
@@ -338,12 +347,17 @@ fn normalize_exact_commit_sha(commit_sha: &str) -> crate::Result<String> {
     })
 }
 
+#[cfg(any(feature = "docker", feature = "daytona", test))]
 pub(crate) fn clean_clone_origin_for_record(clone_origin_url: Option<&str>) -> Option<String> {
     clone_origin_url
         .filter(|url| !url.trim().is_empty())
         .map(fabro_github::normalize_repo_origin_url)
 }
 
+// Unlike the layout/record helpers above, this one has no clone_source unit
+// test of its own — its only callers are the Docker/Daytona record arms — so
+// it excludes `test` to avoid being dead code in an aca-only test build.
+#[cfg(any(feature = "docker", feature = "daytona"))]
 pub(crate) fn repo_cloned_for_record(
     skip_clone: bool,
     clone_origin_url: Option<&str>,
