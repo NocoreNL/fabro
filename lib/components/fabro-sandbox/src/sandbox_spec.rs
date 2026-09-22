@@ -56,14 +56,14 @@ pub enum SandboxSpec {
     },
     // ACA: mirrors `SandboxCreateSpec::Aca`'s field shape (no `api_key` — ACA
     // authenticates via `azure_identity`, not a bearer token) rather than
-    // `Daytona`'s: `AcaConfig` has no `skip_clone`, and `AcaSandbox` clones a
-    // plain branch checkout into its single working directory during
-    // `initialize()` (see `aca/sandbox.rs`'s `clone_if_configured`) rather
-    // than Docker/Daytona's owner/repo layout with a per-create step to pin a
-    // tag/commit against, so `clone_tag`/`clone_commit_sha` would have
-    // nothing to do here. Callers reject a pinned-revision request for this
-    // provider before constructing this variant (see `start.rs`'s
-    // `RunSession::new`).
+    // `Daytona`'s: `AcaConfig` has no `skip_clone`. `clone_tag`/
+    // `clone_commit_sha` carry an optional pinned revision the same way the
+    // Docker/Daytona variants do; `AcaSandbox` clones the branch into its
+    // single working directory during `initialize()` and, when a pin is
+    // present, fetches and checks out that exact revision (see
+    // `aca/sandbox.rs`'s `clone_if_configured`). Sandbox *creation* still
+    // starts from the pre-baked disk image, so `SandboxCreateSpec::Aca`
+    // carries no pin — only this runtime spec does.
     #[cfg(feature = "aca")]
     Aca {
         config:           Box<AcaConfig>,
@@ -71,6 +71,8 @@ pub enum SandboxSpec {
         run_id:           Option<RunId>,
         clone_origin_url: Option<String>,
         clone_branch:     Option<String>,
+        clone_tag:        Option<String>,
+        clone_commit_sha: Option<String>,
     },
 }
 
@@ -306,6 +308,8 @@ impl SandboxSpec {
                 run_id,
                 clone_origin_url,
                 clone_branch,
+                clone_tag,
+                clone_commit_sha,
             } => {
                 let account = aca_account_from_process_env().ok_or_else(|| {
                     anyhow::anyhow!(
@@ -355,10 +359,11 @@ impl SandboxSpec {
 
                 // ACA: thread the clone metadata this arm already
                 // destructured (`github_app`/`clone_origin_url`/
-                // `clone_branch`) into the live `AcaSandbox` handle, so
-                // `initialize()` can actually clone the repo instead of
-                // assuming a pre-baked disk image — this was the
-                // missing-clone gap (see `aca/sandbox.rs`).
+                // `clone_branch`, plus any `clone_tag`/`clone_commit_sha`
+                // pin) into the live `AcaSandbox` handle, so `initialize()`
+                // can clone the repo and check out the pinned revision
+                // instead of assuming a pre-baked disk image (see
+                // `aca/sandbox.rs`).
                 let sandbox = AcaSandbox::new(
                     Arc::new(client),
                     info.id,
@@ -366,6 +371,8 @@ impl SandboxSpec {
                     github_app.as_ref(),
                     clone_origin_url.clone(),
                     clone_branch.clone(),
+                    clone_tag.clone(),
+                    clone_commit_sha.clone(),
                 )
                 .map_err(anyhow::Error::new)?;
                 Ok(Arc::new(sandbox))

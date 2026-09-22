@@ -28,13 +28,16 @@ use crate::aca::client::SandboxState;
 use crate::aca::{AcaApiError, AcaClient, AcaConfig};
 // ACA: clone-on-initialize reuses `git_retry`/`push_credentials`, the same
 // shared helpers Docker's `clone_github_repo` does — see
-// `clone_if_configured`/`clone_github_repo` below. `clone_source` (Docker's
-// owner/repo-layout + tag/commit-pinning helper module) is deliberately NOT
-// reused here: it is feature-gated to `docker`/`daytona` only, and ACA needs
-// just GitHub-origin validation/normalization, not the owner/repo layout or
-// pinned-revision machinery that make up most of that module — widening its
-// feature gate would compile that unused machinery (and its dead-code
-// warnings) into aca-only builds for a handful of lines' worth of reuse.
+// `clone_if_configured`/`clone_github_repo` below. It also reuses
+// `clone_source` for GitHub-origin validation/normalization (`decide_clone`)
+// and the pinned-revision helpers (`PinnedRevision`, `pinned_fetch_command`,
+// `exact_checkout_verify_command`, `FETCH_HEAD_COMMIT`) that fetch and check
+// out an exact tag/commit after the branch clone; those pin helpers are
+// gated `feature = "aca"` alongside `docker` so an aca-only build compiles
+// them. ACA does not use the owner/repo layout part of that module — its
+// sandbox has one flat working directory — so `github_repo_layout` and the
+// init/remote-add path stay unused here.
+use crate::clone_source::{self, PinnedRevision};
 use crate::git_retry::{self, CredentialContext};
 use crate::push_credentials::{self, PushCredentialState};
 use crate::redact::redact_auth_url;
@@ -69,10 +72,15 @@ pub struct AcaSandbox {
     sandbox_id: String,
     config:     AcaConfig,
     // ACA: clone-on-initialize state, mirroring `DockerSandbox`'s
-    // `clone_origin_url`/`clone_branch`/`push_credentials` fields — see
-    // `clone_if_configured`/`clone_github_repo`.
+    // `clone_origin_url`/`clone_branch`/`clone_tag`/`clone_commit_sha`/
+    // `push_credentials` fields — see `clone_if_configured`/
+    // `clone_github_repo`. `clone_tag`/`clone_commit_sha` carry an optional
+    // pinned revision the run must land on instead of the branch's current
+    // HEAD.
     clone_origin_url: Option<String>,
     clone_branch:     Option<String>,
+    clone_tag:        Option<String>,
+    clone_commit_sha: Option<String>,
     push_credentials: PushCredentialState,
     /// Whether `initialize()` cloned a repository into `config.working_dir`.
     /// Unset until `initialize()` runs. Mirrors `DockerSandbox`'s
@@ -85,11 +93,13 @@ pub struct AcaSandbox {
 }
 
 impl AcaSandbox {
-    /// `github_app`/`clone_origin_url`/`clone_branch` mirror
-    /// `DockerSandbox::new`'s parameters: `github_app` (plus the origin) build
-    /// the clone-time token source, and `clone_origin_url`/`clone_branch`
-    /// tell `initialize()` what to clone. Fallible for the same reason
-    /// Docker's constructor is: building the token source can fail (e.g. an
+    /// `github_app`/`clone_origin_url`/`clone_branch`/`clone_tag`/
+    /// `clone_commit_sha` mirror `DockerSandbox::new`'s parameters:
+    /// `github_app` (plus the origin) build the clone-time token source,
+    /// `clone_origin_url`/`clone_branch` tell `initialize()` what to clone,
+    /// and `clone_tag`/`clone_commit_sha` name an optional exact revision to
+    /// check out after the clone. Fallible for the same reason Docker's
+    /// constructor is: building the token source can fail (e.g. an
     /// unparseable origin).
     pub fn new(
         client: Arc<AcaClient>,
@@ -98,6 +108,8 @@ impl AcaSandbox {
         github_app: Option<&fabro_github::GitHubCredentials>,
         clone_origin_url: Option<String>,
         clone_branch: Option<String>,
+        clone_tag: Option<String>,
+        clone_commit_sha: Option<String>,
     ) -> crate::Result<Self> {
         let push_credentials = PushCredentialState::new(push_credentials::build_token_source(
             github_app,
@@ -109,6 +121,8 @@ impl AcaSandbox {
             config,
             clone_origin_url,
             clone_branch,
+            clone_tag,
+            clone_commit_sha,
             push_credentials,
             repo_cloned: OnceCell::new(),
             rg_available: OnceCell::const_new(),
@@ -225,39 +239,42 @@ impl AcaSandbox {
     }
 
     /// Decide whether `initialize()` has anything to clone, and clone it if
-    /// so. ACA has no `skip_clone` knob (`AcaConfig` doesn't carry one — see
-    /// `SandboxSpec::Aca`'s doc comment) and no tag/commit pinning, so this
-    /// only needs the GitHub-origin validation/normalization slice of
-    /// Docker's `clone_source::decide_clone` — inlined here rather than
-    /// reused (see the `clone_source` import comment above).
+    /// so. Reuses `clone_source::decide_clone` — the same origin
+    /// normalization, GitHub-only validation, and pinned-revision
+    /// extraction/validation Docker and Daytona run — so ACA honors the
+    /// identical rules. ACA has no `skip_clone` knob (`AcaConfig` doesn't
+    /// carry one — see `SandboxSpec::Aca`'s doc comment), so it is always
+    /// `false` here.
     async fn clone_if_configured(&self) -> crate::Result<()> {
-        let Some(origin_url) = self
-            .clone_origin_url
-            .as_deref()
-            .filter(|url| !url.trim().is_empty())
-        else {
-            tracing::warn!(
-                provider = "aca",
-                "no clone source was present; creating an empty workspace without repository \
-                 files"
-            );
-            let _ = self.repo_cloned.set(false);
-            return Ok(());
-        };
+        let decision = clone_source::decide_clone(
+            false,
+            self.clone_origin_url.as_deref(),
+            self.clone_branch.as_deref(),
+            self.clone_tag.as_deref(),
+            self.clone_commit_sha.as_deref(),
+        )?;
 
-        let origin_url = fabro_github::normalize_repo_origin_url(origin_url);
-        if let Err(err) = fabro_github::parse_github_owner_repo(&origin_url) {
-            return Err(crate::Error::message(format!(
-                "Clone-based sandboxes currently support GitHub repository origins only: {err}"
-            )));
+        match decision {
+            clone_source::CloneDecision::EmptyWorkspace { reason } => {
+                tracing::warn!(
+                    provider = "aca",
+                    reason = reason.message(),
+                    "no clone source was present; creating an empty workspace without repository \
+                     files"
+                );
+                let _ = self.repo_cloned.set(false);
+                Ok(())
+            }
+            clone_source::CloneDecision::GitHub {
+                origin_url,
+                branch,
+                tag,
+                commit_sha,
+            } => {
+                let pin = PinnedRevision::from_selectors(tag.as_deref(), commit_sha.as_deref());
+                self.clone_github_repo(origin_url, branch, pin).await
+            }
         }
-        let branch = self
-            .clone_branch
-            .as_deref()
-            .filter(|branch| !branch.trim().is_empty())
-            .map(str::to_string);
-
-        self.clone_github_repo(origin_url, branch).await
     }
 
     /// Clone `origin_url` into `config.working_dir` via
@@ -265,15 +282,17 @@ impl AcaSandbox {
     /// inherits the bash contract and egress). Mirrors `docker.rs`'s
     /// `clone_github_repo` (mint a clone-scoped token → embed it in the URL →
     /// run the clone → record the embedded token), but without Docker's
-    /// owner/repo layout, symlink, or tag/commit pinning: an ACA sandbox has
-    /// one flat working directory and `SandboxSpec::Aca` carries no pinned-
-    /// revision fields (see its doc comment). `--branch` alone checks out the
-    /// branch, so no separate checkout step is needed for the (only)
-    /// unpinned-branch case.
+    /// owner/repo layout or symlink: an ACA sandbox has one flat working
+    /// directory. Two mutually-exclusive paths, mirroring Docker: when `pin`
+    /// is present, [`AcaSandbox::init_and_checkout_pin`] seeds `origin` with
+    /// `git init` + `remote add` and fetches the exact tag/commit (no full
+    /// branch clone); otherwise [`AcaSandbox::run_branch_clone`] does a plain
+    /// `--branch` clone and leaves the branch's current HEAD checked out.
     async fn clone_github_repo(
         &self,
         origin_url: String,
         branch: Option<String>,
+        pin: Option<PinnedRevision>,
     ) -> crate::Result<()> {
         // The clone mints its own token (never a warm-cache reuse) and seeds
         // the shared source, so the first refresh compares against the clone
@@ -304,8 +323,53 @@ impl AcaSandbox {
             .as_ref()
             .map_or(origin_url.as_str(), |url| url.as_raw_url().as_str());
 
-        let command = aca_git_clone_command(clone_url, branch.as_deref(), &self.config.working_dir);
+        // Two mutually-exclusive paths, mirroring docker.rs: a pinned run
+        // seeds `origin` with init+remote-add and fetches only the exact
+        // revision (no full branch clone), while an unpinned run does a plain
+        // branch clone. Both leave `origin`'s URL carrying the clone token.
+        match pin.as_ref() {
+            Some(pin) => {
+                self.init_and_checkout_pin(
+                    pin,
+                    branch.as_deref(),
+                    clone_url,
+                    clone_credential_context,
+                    auth_url.as_ref(),
+                )
+                .await?;
+            }
+            None => {
+                self.run_branch_clone(
+                    clone_url,
+                    branch.as_deref(),
+                    clone_credential_context,
+                    auth_url.as_ref(),
+                )
+                .await?;
+            }
+        }
 
+        if let Some(token) = resolved_token {
+            // Whichever path ran embedded this token in `origin`; record it so
+            // a future push refresh compares against the clone generation.
+            self.push_credentials.record_embedded(token).await;
+        }
+
+        let _ = self.repo_cloned.set(true);
+        Ok(())
+    }
+
+    /// Unpinned path: a plain `git clone --branch <branch> --single-branch`
+    /// straight into the working directory, retried under the shared clone
+    /// backoff policy.
+    async fn run_branch_clone(
+        &self,
+        clone_url: &str,
+        branch: Option<&str>,
+        credential_context: CredentialContext,
+        auth_url: Option<&fabro_redact::DisplaySafeUrl>,
+    ) -> crate::Result<()> {
+        let command = aca_git_clone_command(clone_url, branch, &self.config.working_dir);
         let plan = git_retry::RetryPlan::clone_default(None);
         git_retry::retry_git_operation(
             SandboxProviderKind::Aca,
@@ -321,15 +385,11 @@ impl AcaSandbox {
                         let retry_reason = git_retry::classify_output(
                             &result.stderr,
                             &result.stdout,
-                            clone_credential_context,
+                            credential_context,
                         )
                         .retry_reason();
                         Err(AcaCloneFailure {
-                            error: self.clone_failure_error(
-                                result,
-                                "ACA git clone",
-                                auth_url.as_ref(),
-                            ),
+                            error: self.clone_failure_error(result, "ACA git clone", auth_url),
                             retry_reason,
                         })
                     }
@@ -342,14 +402,120 @@ impl AcaSandbox {
             |failure: &AcaCloneFailure| failure.retry_reason,
         )
         .await
+        .map_err(|failure| failure.error)
+    }
+
+    /// Pinned path: seed an empty repo with `git init` + `remote add origin
+    /// <auth_url>` (local, no network — so no retry) and then fetch and check
+    /// out the exact revision. Mirrors docker.rs's pinned branch, which also
+    /// skips the full branch clone the unpinned path does, so the named branch
+    /// need not be independently clone-able — only the pinned revision must be
+    /// fetchable.
+    async fn init_and_checkout_pin(
+        &self,
+        pin: &PinnedRevision,
+        branch: Option<&str>,
+        clone_url: &str,
+        credential_context: CredentialContext,
+        auth_url: Option<&fabro_redact::DisplaySafeUrl>,
+    ) -> crate::Result<()> {
+        let init_command =
+            clone_source::exact_repository_init_command(clone_url, &self.config.working_dir);
+        let result = self
+            .exec_command(&init_command, ACA_CLONE_TIMEOUT_MS, None, None, None)
+            .await
+            .map_err(|error| {
+                crate::Error::context("ACA pinned repository init transport failed", error)
+            })?;
+        if !result.is_success() {
+            return Err(self.clone_failure_error(result, "ACA pinned repository init", auth_url));
+        }
+        self.fetch_and_checkout_pin(pin, branch, credential_context, auth_url)
+            .await
+    }
+
+    /// Fetch the pinned revision into the `origin` remote seeded by
+    /// [`AcaSandbox::init_and_checkout_pin`] and attach the working branch to
+    /// it, then verify HEAD.
+    /// Mirrors `docker.rs`'s pinned-checkout tail (fetch the revision →
+    /// `checkout -B <branch> FETCH_HEAD^{commit}` → verify), reusing the
+    /// shared `clone_source` command builders and `git_retry`. The fetch runs
+    /// against `origin` (whose URL `init_and_checkout_pin` already embedded the
+    /// token into), so no fresh authenticated URL is minted; `auth_url` is used
+    /// only to redact that token out of any failure output.
+    async fn fetch_and_checkout_pin(
+        &self,
+        pin: &PinnedRevision,
+        branch: Option<&str>,
+        credential_context: CredentialContext,
+        auth_url: Option<&fabro_redact::DisplaySafeUrl>,
+    ) -> crate::Result<()> {
+        // `decide_clone` already rejects a pinned revision without a branch;
+        // re-check so the checkout can never silently drop the branch name
+        // callers read back out of the workspace.
+        let Some(branch) = branch.filter(|branch| !branch.trim().is_empty()) else {
+            return Err(crate::Error::message(format!(
+                "{} requires a repository branch",
+                pin.label()
+            )));
+        };
+        let working_dir = self.config.working_dir.clone();
+
+        // Fetch the exact revision by name (full history — ACA has no
+        // `clone_depth` knob), reusing the clone's retry/backoff policy so a
+        // transient network failure is retried the same way.
+        let fetch_command =
+            clone_source::pinned_fetch_command(&working_dir, "origin", &pin.fetch_refspec(), None);
+        let plan = git_retry::RetryPlan::clone_default(None);
+        git_retry::retry_git_operation(
+            SandboxProviderKind::Aca,
+            "fetch",
+            &plan,
+            |_attempt| async {
+                match self
+                    .exec_command(&fetch_command, ACA_CLONE_TIMEOUT_MS, None, None, None)
+                    .await
+                {
+                    Ok(result) if result.is_success() => Ok(()),
+                    Ok(result) => {
+                        let retry_reason = git_retry::classify_output(
+                            &result.stderr,
+                            &result.stdout,
+                            credential_context,
+                        )
+                        .retry_reason();
+                        Err(AcaCloneFailure {
+                            error: self.clone_failure_error(result, "ACA pinned fetch", auth_url),
+                            retry_reason,
+                        })
+                    }
+                    Err(error) => Err(AcaCloneFailure {
+                        error: crate::Error::context("ACA pinned fetch transport failed", error),
+                        retry_reason: None,
+                    }),
+                }
+            },
+            |failure: &AcaCloneFailure| failure.retry_reason,
+        )
+        .await
         .map_err(|failure| failure.error)?;
 
-        if let Some(token) = resolved_token {
-            // The clone URL embedded this token in `origin`; record it so a
-            // future push refresh compares against the clone generation.
-            self.push_credentials.record_embedded(token).await;
+        // Attach the working branch to the fetched commit and read HEAD back
+        // in one command; stdout is the `rev-parse HEAD` output `verify_head`
+        // validates (and, for a commit pin, matches against the request).
+        let checkout_command = clone_source::exact_checkout_verify_command(
+            &working_dir,
+            branch,
+            clone_source::FETCH_HEAD_COMMIT,
+        );
+        let result = self
+            .exec_command(&checkout_command, ACA_CLONE_TIMEOUT_MS, None, None, None)
+            .await
+            .map_err(|error| crate::Error::context("ACA pinned checkout transport failed", error))?;
+        if !result.is_success() {
+            return Err(self.clone_failure_error(result, "ACA pinned checkout", auth_url));
         }
-        let _ = self.repo_cloned.set(true);
+        pin.verify_head(&result.stdout)?;
         Ok(())
     }
 
@@ -380,11 +546,11 @@ struct AcaCloneFailure {
     retry_reason: Option<git_retry::GitRetryReason>,
 }
 
-/// Build the `git clone` command for the (only) case ACA supports: an
-/// unpinned branch clone straight into `checkout_path`. Mirrors `docker.rs`'s
-/// `git_clone_command`, minus the `--depth` argument: `AcaConfig` has no
-/// `clone_depth` knob to plumb through, so every ACA clone fetches full
-/// history.
+/// Build the `git clone` command that seeds `checkout_path`: a plain branch
+/// clone. A pinned run layers `fetch_and_checkout_pin` on top of this to land
+/// the exact revision. Mirrors `docker.rs`'s `git_clone_command`, minus the
+/// `--depth` argument: `AcaConfig` has no `clone_depth` knob to plumb through,
+/// so every ACA clone fetches full history.
 fn aca_git_clone_command(clone_url: &str, branch: Option<&str>, checkout_path: &str) -> String {
     let mut command = format!("{} clone", crate::sandbox::GIT);
     if let Some(branch) = branch {
@@ -774,6 +940,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .expect("test sandbox construction should succeed")
     }
@@ -789,6 +957,16 @@ mod tests {
         clone_origin_url: Option<&str>,
         clone_branch: Option<&str>,
     ) -> AcaSandbox {
+        test_sandbox_with_pin(server, clone_origin_url, clone_branch, None, None)
+    }
+
+    fn test_sandbox_with_pin(
+        server: &MockServer,
+        clone_origin_url: Option<&str>,
+        clone_branch: Option<&str>,
+        clone_tag: Option<&str>,
+        clone_commit_sha: Option<&str>,
+    ) -> AcaSandbox {
         AcaSandbox::new(
             Arc::new(test_client(server)),
             SANDBOX_ID.to_string(),
@@ -798,6 +976,8 @@ mod tests {
             )),
             clone_origin_url.map(str::to_string),
             clone_branch.map(str::to_string),
+            clone_tag.map(str::to_string),
+            clone_commit_sha.map(str::to_string),
         )
         .expect("test sandbox construction should succeed")
     }
@@ -1165,6 +1345,80 @@ mod tests {
         // clone into /workspace) and that a token was embedded, without ever
         // asserting on a real credential.
         clone_mock.assert_async().await;
+    }
+
+    /// `initialize()` with a `clone_commit_sha` pin takes the Docker-style
+    /// pinned path: `git init` + `remote add origin` (no full branch clone),
+    /// then fetch the exact commit into `origin` and check it out onto the
+    /// working branch. Asserts the init/fetch/checkout exec bodies match the
+    /// shared `clone_source` builders, that no `git clone` is issued, and that
+    /// a HEAD matching the pin lets initialize succeed — the exact chain the
+    /// ACA reject used to block.
+    #[tokio::test]
+    async fn initialize_checks_out_the_pinned_commit_without_a_branch_clone() {
+        const PINNED_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+        let server = MockServer::start_async().await;
+        let _probe_mock = mock_exec_expecting(
+            &server,
+            &format!("env -u BASH_ENV /bin/bash -c {}", shell_quote(BASH_PROBE_SCRIPT)),
+            "fabro-bash-ready\n",
+            "",
+            0,
+        )
+        .await;
+
+        let auth_url =
+            fabro_github::embed_token_in_url("https://github.com/acme/widgets", FAKE_CLONE_PAT)
+                .expect("embed fake token in clone url");
+        // Bind each wrapped command (and the checkout's stdout) to a `let`:
+        // `mock_exec_expecting` returns a `Mock` borrowing these `&str`s, and
+        // the asserts below extend that borrow past the statement, so the
+        // strings must outlive the mocks (the probe above can stay inline —
+        // its `_`-bound mock is never used again).
+        let init_command =
+            clone_source::exact_repository_init_command(auth_url.as_raw_url().as_str(), "/workspace");
+        let init_command_wrapped =
+            format!("env -u BASH_ENV /bin/bash -c {}", shell_quote(&init_command));
+        let init_mock = mock_exec_expecting(&server, &init_command_wrapped, "", "", 0).await;
+
+        let pin = PinnedRevision::from_selectors(None, Some(PINNED_SHA))
+            .expect("commit selector builds a pin");
+        let fetch_command =
+            clone_source::pinned_fetch_command("/workspace", "origin", &pin.fetch_refspec(), None);
+        let fetch_command_wrapped =
+            format!("env -u BASH_ENV /bin/bash -c {}", shell_quote(&fetch_command));
+        let fetch_mock = mock_exec_expecting(&server, &fetch_command_wrapped, "", "", 0).await;
+
+        let checkout_command = clone_source::exact_checkout_verify_command(
+            "/workspace",
+            "main",
+            clone_source::FETCH_HEAD_COMMIT,
+        );
+        let checkout_command_wrapped =
+            format!("env -u BASH_ENV /bin/bash -c {}", shell_quote(&checkout_command));
+        // The checkout command ends in `rev-parse HEAD`; return the pinned SHA
+        // as its stdout so `verify_head` confirms HEAD landed on the request.
+        let checkout_stdout = format!("{PINNED_SHA}\n");
+        let checkout_mock =
+            mock_exec_expecting(&server, &checkout_command_wrapped, &checkout_stdout, "", 0).await;
+
+        let sandbox = test_sandbox_with_pin(
+            &server,
+            Some("https://github.com/acme/widgets"),
+            Some("main"),
+            None,
+            Some(PINNED_SHA),
+        );
+
+        sandbox
+            .initialize()
+            .await
+            .expect("initialize should init, fetch, and check out the pinned commit");
+
+        init_mock.assert_async().await;
+        fetch_mock.assert_async().await;
+        checkout_mock.assert_async().await;
     }
 
     #[tokio::test]
@@ -1900,9 +2154,17 @@ mod tests {
                 group.clone(),
             ));
             // Use Result throughout (never panic) so teardown always runs.
-            let sandbox =
-                AcaSandbox::new(client, sandbox_id.clone(), config.clone(), None, None, None)
-                    .map_err(|e| format!("build AcaSandbox: {e}"))?;
+            let sandbox = AcaSandbox::new(
+                client,
+                sandbox_id.clone(),
+                config.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .map_err(|e| format!("build AcaSandbox: {e}"))?;
 
             // Readiness: BASH_PROBE gate.
             sandbox

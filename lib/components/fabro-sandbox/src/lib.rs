@@ -8,7 +8,11 @@ pub mod provider;
 pub mod sandbox;
 pub mod sandbox_spec;
 
-#[cfg(any(feature = "docker", feature = "daytona"))]
+// ACA reuses `clone_source` too — `decide_clone` for origin validation and the
+// `PinnedRevision`/pinned-checkout helpers (see `aca/sandbox.rs`). In real
+// builds `docker`/`daytona` are always on alongside `aca`, so this only widens
+// the isolated aca-only build.
+#[cfg(any(feature = "docker", feature = "daytona", feature = "aca"))]
 mod clone_source;
 
 mod git_retry;
