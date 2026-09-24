@@ -68,9 +68,27 @@ pub fn aca_config_from_environment(settings: &RunEnvironmentSettings) -> AcaConf
         egress: AcaEgressPolicy {
             // ACA: sandboxes deny egress by default; the `[aca.egress].allow`
             // domain list (not the generic CIDR-based `network.allow`, which
-            // ACA doesn't use) is the only way out.
+            // ACA doesn't use) is the only way out. `AcaEgressPolicy::rules`
+            // are the CLI's `pattern:Action` shorthand that `AcaClient::set_egress`
+            // consumes — a rule WITHOUT a `:Action` inherits `default_action`
+            // (here `"Deny"`), so a bare allow domain would silently DENY the
+            // very host it's meant to permit (the egress proxy then answers
+            // `403 x-deny-reason: <host>:GET`). Qualify each allow entry with
+            // `:Allow` so it actually opens the host.
             default_action:     "Deny".to_string(),
-            rules:              settings.aca.egress.allow.clone(),
+            rules:              settings
+                .aca
+                .egress
+                .allow
+                .iter()
+                .map(|domain| {
+                    if domain.contains(':') {
+                        domain.clone()
+                    } else {
+                        format!("{domain}:Allow")
+                    }
+                })
+                .collect(),
             traffic_inspection: settings
                 .aca
                 .egress
@@ -393,9 +411,14 @@ mod tests {
         // "3815Mi" (see `aca_memory_string`'s doc comment).
         assert_eq!(config.cpu.as_deref(), Some("2000m"));
         assert_eq!(config.memory.as_deref(), Some("3815Mi"));
+        // Each allow domain is qualified with `:Allow` so `set_egress` opens
+        // it instead of falling back to the `Deny` default.
         assert_eq!(
             config.egress.rules,
-            vec!["*.github.com".to_string(), "api.anthropic.com".to_string()]
+            vec![
+                "*.github.com:Allow".to_string(),
+                "api.anthropic.com:Allow".to_string()
+            ]
         );
         assert_eq!(config.egress.traffic_inspection, "Full");
         assert_eq!(config.egress.default_action, "Deny");
