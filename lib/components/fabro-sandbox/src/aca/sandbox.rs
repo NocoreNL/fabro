@@ -575,7 +575,22 @@ impl Sandbox for AcaSandbox {
         env_vars: Option<&HashMap<String, String>>,
         cancel_token: Option<CancellationToken>,
     ) -> crate::Result<ExecResult> {
-        let wrapped = Self::wrap_command(command, working_dir, env_vars);
+        // Once `initialize()` has cloned into `config.working_dir`, default a
+        // caller-omitted `working_dir` to it, so shared exec helpers that pass
+        // no cwd — notably `setup_git_via_exec`'s `git rev-parse HEAD` — and
+        // agent commands run inside the checked-out repo, mirroring
+        // Docker/Daytona (whose exec runs in the working directory by default).
+        // Before the clone, `working_dir` stays as given: the bash probe and
+        // the init/clone commands run at the sandbox default (`/`) and address
+        // `/workspace` by explicit path, since it does not exist yet.
+        let effective_working_dir = working_dir.or_else(|| {
+            self.repo_cloned
+                .get()
+                .copied()
+                .unwrap_or(false)
+                .then_some(self.config.working_dir.as_str())
+        });
+        let wrapped = Self::wrap_command(command, effective_working_dir, env_vars);
         let start = Instant::now();
         let token = cancel_token.unwrap_or_default();
 
@@ -1973,9 +1988,12 @@ mod tests {
             0,
         )
         .await;
+        // After the clone sets `repo_cloned`, exec defaults its cwd to the
+        // working directory, so setup_git's git commands are `cd /workspace &&
+        // …`.
         let _branch_mock = mock_exec_expecting(
             &server,
-            "env -u BASH_ENV /bin/bash -c 'git rev-parse --abbrev-ref HEAD'",
+            "env -u BASH_ENV /bin/bash -c 'cd /workspace && git rev-parse --abbrev-ref HEAD'",
             "main\n",
             "",
             0,
@@ -1983,7 +2001,7 @@ mod tests {
         .await;
         let _sha_mock = mock_exec_expecting(
             &server,
-            "env -u BASH_ENV /bin/bash -c 'git rev-parse HEAD'",
+            "env -u BASH_ENV /bin/bash -c 'cd /workspace && git rev-parse HEAD'",
             "abc123\n",
             "",
             0,
@@ -1991,7 +2009,7 @@ mod tests {
         .await;
         let checkout_mock = mock_exec_expecting(
             &server,
-            "env -u BASH_ENV /bin/bash -c 'git checkout -B fabro/run/run-1 abc123'",
+            "env -u BASH_ENV /bin/bash -c 'cd /workspace && git checkout -B fabro/run/run-1 abc123'",
             "",
             "",
             0,
