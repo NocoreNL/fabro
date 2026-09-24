@@ -489,11 +489,24 @@ pub fn sign_app_jwt(app_id: &str, private_key_pem: &str) -> anyhow::Result<Strin
 }
 
 /// Standard GitHub API headers for authenticated requests.
+///
+/// The `User-Agent` is deployment-unique (`nocore-fabro-server/<crate-version>`)
+/// rather than a bare `"fabro"`. GitHub's secondary rate-limit / abuse-detection
+/// keys on the User-Agent, and a short generic UA shared across every Fabro
+/// instance is prone to aggregate throttling: once tripped, *git operations*
+/// using tokens minted under that UA return `403`/`404` ("Repository not found")
+/// even though the token, its permissions, and repository access are all valid —
+/// while an identically-scoped token minted under a distinct UA works. A
+/// versioned, `nocore-`-prefixed UA gives this build its own throttling bucket,
+/// distinct from the generic `"fabro"` and any other fork. (GitHub's own guidance
+/// is to use a unique User-Agent.)
+const GITHUB_USER_AGENT: &str = concat!("nocore-fabro-server/", env!("CARGO_PKG_VERSION"));
+
 fn github_headers(auth: &str) -> [(&str, &str); 3] {
     [
         ("Authorization", auth),
         ("Accept", "application/vnd.github+json"),
-        ("User-Agent", "fabro"),
+        ("User-Agent", GITHUB_USER_AGENT),
     ]
 }
 
@@ -1033,7 +1046,10 @@ pub async fn enable_auto_merge_with_client(
         client,
         HttpMethod::Post,
         &graphql_url,
-        &[("Authorization", auth.as_str()), ("User-Agent", "fabro")],
+        &[
+            ("Authorization", auth.as_str()),
+            ("User-Agent", GITHUB_USER_AGENT),
+        ],
         Some(&graphql_body),
     )
     .await
